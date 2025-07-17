@@ -199,7 +199,7 @@ def test_camera_device(device_path):
         return False
 
 class MQTTClient:
-    def __init__(self, broker_host='localhost', broker_port=1883, topic_prefix='camera', gst_server=None):
+    def __init__(self, broker_host='127.0.0.1', broker_port=1883, topic_prefix='camera', gst_server=None):
         """MQTT 클라이언트 초기화"""
         self.broker_host = broker_host
         self.broker_port = broker_port
@@ -1172,7 +1172,7 @@ class ByteTracker:
 
 class RKNNDetector:
     def __init__(self, model_path='/home/spcwtech/yolo5n_fish-rk3566.rknn', 
-                 mqtt_broker='localhost', mqtt_port=1883):
+                 mqtt_broker='127.0.0.1', mqtt_port=1883):
         self.rknn = RKNN()
         try:
             ret = self.rknn.load_rknn(model_path)
@@ -1595,8 +1595,8 @@ def main():
     # 설정 파일 로드
     config = {
         "mqtt": {
-            "broker_host": "localhost",
-            "broker_port": 1883,
+            "broker_host": os.getenv("MQTT_BROKER_HOST", "127.0.0.1"),
+            "broker_port": int(os.getenv("MQTT_BROKER_PORT", "1883")),
             "topic_prefix": "camera"
         },
         "http": {
