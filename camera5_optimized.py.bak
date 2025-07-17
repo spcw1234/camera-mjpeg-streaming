@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""
+최적화된 카메라 스트리밍 프로그램
+- DeepSORT 비활성화로 성능 향상
+- 프레임 스킵 기능 추가
+- 경량화된 처리 파이프라인
+"""
+
+import cv2
+import gi
+import os
+import serial
+import threading
+import sys
+import termios
+import tty
+import time
+import select
+import numpy as np
+import json
+import uuid
+import traceback
+import paho.mqtt.client as mqtt
+import hashlib
+import subprocess
+import time
+from pynput import keyboard
+from rknnlite.api import RKNNLite as RKNN
+
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer, GLib
+
+def test_camera_device(device_path):
+    """Test if a camera device is working"""
+    try:
+        cap = cv2.VideoCapture(device_path)
+        if not cap.isOpened():
+            return False
+        ret, frame = cap.read()
+        cap.release()
+        return ret and frame is not None
+    except:
+        return False
+
+class GStreamerRTSPServer:
+    def __init__(self, port=7200, mount_point="/test"):
+        """GStreamer RTSP 서버 초기화 - 성능 최적화 버전"""
+        self.port = port
+        self.mount_point = mount_point
+        self.server = None
+        self.factory = None
+        self.mainloop = None
+        self.running = False
+        self.appsrc = None
+        self.need_data = True
+        self.clients_connected = 0
+        self.frame_count = 0
+        
+        # GStreamer 초기화
+        if not Gst.is_initialized():
+            Gst.init(None)
+        
+        print(f"최적화된 RTSP 서버 초기화 - Port: {port}, Mount: {mount_point}")
+    
+    def create_pipeline(self):
+        """성능 최적화된 파이프라인 - 더 빠른 인코딩 설정"""
+        pipeline_str = (
+            "( appsrc name=source is-live=true block=false format=GST_FORMAT_TIME "
+            "caps=video/x-raw,format=BGRx,width=640,height=640,framerate=10/1 ! "
+            "videoconvert ! video/x-raw,format=I420 ! "
+            "x264enc speed-preset=superfast tune=zerolatency bitrate=1000 threads=2 "
+            "key-int-max=10 bframes=0 ! "
+            "rtph264pay config-interval=1 name=pay0 pt=96 )"
+        )
+        return pipeline_str
+    
+    def start_server(self):
+        """RTSP 서버 시작"""
+        try:
+            self.server = GstRtspServer.RTSPServer()
+            self.server.set_service(str(self.port))
+            
+            self.factory = GstRtspServer.RTSPMediaFactory()
+            self.factory.set_launch(self.create_pipeline())
+            self.factory.set_shared(True)
+            
+            # 미디어 팩토리에 콜백 연결
+            self.factory.connect("media-configure", self.on_media_configure)
+            
+            mount_points = self.server.get_mount_points()
+            mount_points.add_factory(self.mount_point, self.factory)
+            
+            self.server.attach(None)
+            
+            # GLib 메인 루프를 별도 스레드에서 실행
+            self.start_glib_loop()
+            
+            self.running = True
+            
+            print(f"최적화된 RTSP 서버 시작됨 - rtsp://spcwtech.mooo.com:{self.port}{self.mount_point}")
+            return True
+            
+        except Exception as e:
+            print(f"RTSP 서버 시작 실패: {e}")
+            traceback.print_exc()
+            return False
+    
+    def start_glib_loop(self):
+        """GLib 메인 루프를 별도 스레드에서 시작"""
+        def glib_loop():
+            try:
+                context = GLib.MainContext.new()
+                GLib.MainContext.push_thread_default(context)
+                
+                self.mainloop = GLib.MainLoop.new(context, False)
+                self.mainloop.run()
+            except Exception as e:
+                print(f"GLib 메인 루프 오류: {e}")
+            finally:
+                try:
+                    GLib.MainContext.pop_thread_default()
+                except:
+                    pass
+        
+        import threading
+        self.glib_thread = threading.Thread(target=glib_loop, daemon=True)
+        self.glib_thread.start()
+    
+    def on_media_configure(self, factory, media):
+        """미디어가 구성될 때 호출되는 콜백"""
+        try:
+            element = media.get_element()
+            if element:
+                self.appsrc = element.get_by_name("source")
+                if self.appsrc:
+                    # 최적화된 appsrc 설정
+                    self.appsrc.set_property("is-live", True)
+                    self.appsrc.set_property("block", False)  # non-blocking으로 변경
+                    self.appsrc.set_property("format", Gst.Format.TIME)
+                    self.appsrc.set_property("emit-signals", True)
+                    
+                    # 버퍼 크기 최적화
+                    self.appsrc.set_property("max-bytes", 1000000)  # 1MB
+                    self.appsrc.set_property("drop", True)  # 프레임 드롭 허용
+                    
+                    # 신호 연결
+                    self.appsrc.connect("need-data", self.on_need_data)
+                    self.appsrc.connect("enough-data", self.on_enough_data)
+                    
+                    # 낮은 프레임레이트로 caps 설정
+                    caps = Gst.Caps.from_string("video/x-raw,format=BGRx,width=640,height=640,framerate=10/1")
+                    self.appsrc.set_property("caps", caps)
+                    
+                    self.clients_connected += 1
+                    print(f"클라이언트 연결됨 (총 {self.clients_connected}개)")
+        except Exception as e:
+            print(f"미디어 구성 오류: {e}")
+    
+    def on_need_data(self, src, length):
+        """데이터가 필요할 때 호출"""
+        self.need_data = True
+        
+    def on_enough_data(self, src):
+        """충분한 데이터가 있을 때 호출"""
+        self.need_data = False
+    
+    def push_frame(self, frame):
+        """프레임 푸시 - 성능 최적화"""
+        try:
+            if not self.running or self.appsrc is None:
+                return False
+
+            if frame is None:
+                return False
+
+            # 프레임 스킵 로직 (매 2번째 프레임만 전송)
+            self.frame_count += 1
+            if self.frame_count % 2 != 0:
+                return True  # 프레임 스킵
+
+            # BGRx 변환 (더 빠른 방법)
+            if frame.shape[2] == 3:  # BGR
+                frame_bgrx = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+            else:
+                frame_bgrx = frame
+                
+            data = frame_bgrx.tobytes()
+            buf = Gst.Buffer.new_allocate(None, len(data), None)
+            buf.fill(0, data)
+            
+            # 간단한 타임스탬프
+            if not hasattr(self, 'pts'):
+                self.pts = 0
+                self.duration = Gst.SECOND // 10  # 10 FPS
+            
+            buf.pts = self.pts
+            buf.duration = self.duration
+            self.pts += self.duration
+
+            # non-blocking 푸시
+            retval = self.appsrc.emit('push-buffer', buf)
+            return retval == Gst.FlowReturn.OK
+                
+        except Exception as e:
+            print(f"프레임 푸시 오류: {e}")
+            return False
+    
+    def stop_server(self):
+        """RTSP 서버 중지"""
+        if self.running:
+            self.running = False
+            print("RTSP 서버 중지 중...")
+            
+            if self.appsrc:
+                try:
+                    self.appsrc.emit("end-of-stream")
+                except Exception as e:
+                    pass
+            
+            if self.mainloop:
+                try:
+                    def quit_mainloop():
+                        self.mainloop.quit()
+                        return False
+                    
+                    GLib.idle_add(quit_mainloop)
+                    
+                    if hasattr(self, 'glib_thread') and self.glib_thread.is_alive():
+                        self.glib_thread.join(timeout=2.0)
+                        
+                except Exception as e:
+                    pass
+                    
+            print("RTSP 서버 중지 완료")
+    
+    def get_rtsp_url(self):
+        """RTSP URL 반환"""
+        return f"rtsp://spcwtech.mooo.com:{self.port}{self.mount_point}"
+
+class OptimizedRKNNDetector:
+    def __init__(self, model_path='/home/spcwtech/yolo5n_fish-rk3566.rknn'):
+        """최적화된 RKNN 디텍터 - DeepSORT 없이 빠른 처리"""
+        self.rknn = RKNN()
+        try:
+            ret = self.rknn.load_rknn(model_path)
+            if ret != 0:
+                print('RKNN 모델 로드 실패')
+                exit(ret)
+                
+            ret = self.rknn.init_runtime()
+            if ret != 0:
+                print('RKNN 런타임 초기화 실패')
+                exit(ret)
+        except Exception as e:
+            print(f"RKNN 초기화 오류: {e}")
+            traceback.print_exc()
+            
+        self.input_size = 640
+        
+        # 클래스 이름 로드
+        try:
+            with open("coco.names", "r") as f:
+                self.classes = [line.strip() for line in f.readlines()]
+        except FileNotFoundError:
+            self.classes = [f"class_{i}" for i in range(80)]
+
+        # 성능 측정용
+        self.frame_count = 0
+        self.skip_frames = 2  # 매 2프레임마다 처리
+        self.last_detection_time = time.time()
+        
+        print("최적화된 RKNN 디텍터 초기화 완료 (DeepSORT 비활성화)")
+
+    def letterbox(self, img, new_shape=(640, 640), color=(114, 114, 114)):
+        """빠른 letterbox 변환"""
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        dw /= 2
+        dh /= 2
+        
+        if shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+            
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return img, r, (dw, dh)
+
+    def decode_predictions(self, output, conf_thres=0.3, max_score=0.95):
+        """빠른 디코딩 - 신뢰도 임계값 높임"""
+        try:
+            pred = output[0].squeeze().transpose(1, 0)
+            boxes_raw = pred[:, :4]
+            objectness = pred[:, 4] * 10
+            class_probs = pred[:, 5:] * 2
+            class_conf = np.max(class_probs, axis=1)
+            class_ids = np.argmax(class_probs, axis=1)
+            scores = objectness + class_conf 
+            
+            # 더 높은 임계값으로 필터링
+            mask = (scores > conf_thres) & (scores <= max_score)
+            boxes_xywh = boxes_raw[mask]
+            scores_filtered = scores[mask]
+            class_ids_filtered = class_ids[mask]
+            
+            if len(boxes_xywh) == 0:
+                return np.array([])
+            
+            detections = np.column_stack([
+                boxes_xywh,
+                scores_filtered,
+                class_ids_filtered
+            ])
+            
+            return detections
+        except Exception as e:
+            return np.array([])
+
+    def apply_nms(self, detections, iou_thres=0.45):
+        """빠른 NMS"""
+        try:
+            if len(detections) == 0:
+                return []
+            
+            boxes = detections[:, :4]
+            scores = detections[:, 4]
+            
+            indices = cv2.dnn.NMSBoxes(
+                boxes.tolist(), 
+                scores.tolist(), 
+                score_threshold=0.4,  # 더 높은 임계값
+                nms_threshold=iou_thres
+            )
+            
+            if len(indices) == 0:
+                return []
+            
+            if isinstance(indices, tuple):
+                indices = indices[0]
+            else:
+                indices = indices.flatten()
+                
+            return detections[indices]
+        except Exception as e:
+            return []
+
+    def detect(self, frame):
+        """최적화된 감지 - 프레임 스킵과 간단한 처리"""
+        try:
+            if frame is None:
+                return frame
+
+            # 프레임 스킵 로직
+            self.frame_count += 1
+            draw_frame = frame.copy()
+            
+            # 매 N번째 프레임만 처리
+            if self.frame_count % self.skip_frames != 0:
+                return draw_frame
+
+            start_time = time.time()
+            
+            # 1. 전처리
+            img, ratio, pad = self.letterbox(frame, new_shape=(self.input_size, self.input_size))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = np.expand_dims(img, axis=0)
+
+            # 2. RKNN 추론
+            try:
+                outputs = self.rknn.inference(inputs=[img])
+            except Exception as e:
+                return draw_frame
+
+            # 3. 후처리 (빠른 버전)
+            detections = self.decode_predictions(outputs, conf_thres=0.3, max_score=0.95)
+            detections = self.apply_nms(detections, iou_thres=0.45)
+            
+            # 4. 결과 그리기 (간단하게)
+            for det in detections:
+                x, y, w, h, score, class_id = det
+                class_id = int(class_id)
+                
+                # 좌표 변환
+                x = (x - pad[0]) / ratio
+                y = (y - pad[1]) / ratio
+                w = w / ratio
+                h = h / ratio
+                
+                x1 = int(max(0, x - w/2))
+                y1 = int(max(0, y - h/2))
+                x2 = int(min(frame.shape[1]-1, x + w/2))
+                y2 = int(min(frame.shape[0]-1, y + h/2))
+
+                if (x2-x1 < 5) or (y2-y1 < 5):
+                    continue
+
+                # 간단한 박스와 라벨만 그리기
+                class_name = self.classes[class_id] if class_id < len(self.classes) else f"class_{class_id}"
+                color = (0, 255, 0)
+                cv2.rectangle(draw_frame, (x1, y1), (x2, y2), color, 2)
+                
+                label = f"{class_name}: {score:.2f}"
+                cv2.putText(draw_frame, label, (x1, y1-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+            
+            processing_time = time.time() - start_time
+            
+            # 성능 정보 표시
+            fps = 1.0 / processing_time if processing_time > 0 else 0
+            cv2.putText(draw_frame, f"Process FPS: {fps:.1f}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(draw_frame, f"Process Time: {processing_time*1000:.1f}ms", (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+            cv2.putText(draw_frame, f"Objects: {len(detections)}", (10, 90), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            
+            # 성능 로그 (10프레임마다)
+            if self.frame_count % 20 == 0:
+                actual_fps = 1.0 / processing_time if processing_time > 0 else 0
+                print(f"🚀 최적화된 처리 - FPS: {actual_fps:.1f}, 처리시간: {processing_time*1000:.1f}ms, 객체: {len(detections)}개")
+                
+                if processing_time > 0.2:  # 200ms 초과시
+                    print(f"⚠️  여전히 느림: {processing_time*1000:.1f}ms")
+                elif processing_time < 0.05:  # 50ms 미만시
+                    print(f"✅ 성능 양호: {processing_time*1000:.1f}ms")
+            
+            return draw_frame
+
+        except Exception as e:
+            print(f"감지 오류: {e}")
+            return frame
+
+def find_working_camera():
+    """Find the first working video device"""
+    for i in range(12):
+        device = f'/dev/video{i}'
+        if test_camera_device(device):
+            print(f"✓ 카메라 발견: {device}")
+            return device
+    
+    raise Exception("작동하는 카메라를 찾을 수 없습니다")
+
+def main():
+    """최적화된 메인 함수"""
+    print("=== 최적화된 카메라 스트리밍 시작 ===")
+    print("- DeepSORT 비활성화")
+    print("- 프레임 스킵 활성화")
+    print("- 빠른 인코딩 설정")
+    
+    cap = None
+    detector = None
+    gst_server = None
+    
+    try:
+        # GStreamer 초기화
+        if not Gst.is_initialized():
+            Gst.init(None)
+        
+        # 카메라 찾기
+        video_device = find_working_camera()
+        
+        # 카메라 초기화 (낮은 해상도로)
+        cap = cv2.VideoCapture(video_device)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
+        cap.set(cv2.CAP_PROP_FPS, 15)  # 낮은 FPS 설정
+        
+        if not cap.isOpened():
+            raise Exception("카메라를 열 수 없습니다")
+        
+        print("✓ 카메라 초기화 완료")
+        
+        # 최적화된 디텍터 초기화
+        detector = OptimizedRKNNDetector()
+        print("✓ 최적화된 디텍터 초기화 완료")
+        
+        # RTSP 서버 초기화
+        gst_server = GStreamerRTSPServer(port=7200, mount_point="/test")
+        if not gst_server.start_server():
+            raise Exception("RTSP 서버 시작 실패")
+        print("✓ 최적화된 RTSP 서버 시작 완료")
+        
+        print(f"\n🎥 스트리밍 URL: {gst_server.get_rtsp_url()}")
+        print("🚀 최적화된 처리 시작... (Ctrl+C로 종료)")
+        
+        frame_count = 0
+        start_time = time.time()
+        
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            
+            # 프레임 처리
+            processed_frame = detector.detect(frame)
+            
+            # RTSP 스트리밍
+            gst_server.push_frame(processed_frame)
+            
+            # 통계 (100프레임마다)
+            frame_count += 1
+            if frame_count % 100 == 0:
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed
+                print(f"📊 전체 통계 - 평균 FPS: {fps:.1f}, 총 프레임: {frame_count}")
+                start_time = time.time()
+                frame_count = 0
+            
+            # 짧은 대기
+            time.sleep(0.001)
+    
+    except KeyboardInterrupt:
+        print("\n종료 신호 받음...")
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        traceback.print_exc()
+    finally:
+        print("리소스 정리 중...")
+        
+        if cap and cap.isOpened():
+            cap.release()
+            print("✓ 카메라 해제")
+        
+        if gst_server:
+            gst_server.stop_server()
+            print("✓ RTSP 서버 중지")
+        
+        if detector:
+            del detector
+            print("✓ 디텍터 정리")
+        
+        print("✅ 최적화된 프로그램 종료 완료")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print(f"메인 함수 오류: {e}")
+        traceback.print_exc()

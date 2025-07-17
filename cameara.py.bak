@@ -1,0 +1,417 @@
+import cv2
+import gi
+import os
+import serial
+import threading
+import sys
+import time
+import numpy as np
+from pynput import keyboard
+from rknnlite.api import RKNNLite as RKNN
+
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer, GLib
+
+def test_camera_device(device_path):
+    """Test if a camera device is working"""
+    try:
+        cap = cv2.VideoCapture(device_path)
+        if not cap.isOpened():
+            return False
+        ret, frame = cap.read()
+        cap.release()
+        return ret and frame is not None
+    except:
+        return False
+
+class KeyboardController:
+    def __init__(self, serial_port='/dev/ttyS3', baudrate=115200):
+        self.ser = serial.Serial(serial_port, baudrate)
+        self.running = True
+
+    def on_press(self, key):
+        command = None
+        try:
+            if key == keyboard.Key.up:
+                command = 'up'
+            elif key == keyboard.Key.down:
+                command = 'down'
+            elif key == keyboard.Key.left:
+                command = 'left'
+            elif key == keyboard.Key.right:
+                command = 'right'
+            elif key == keyboard.Key.esc:
+                self.running = False
+                return False
+
+            if command:
+                try:
+                    self.ser.write(f"{command}\n".encode())
+                    print(f"명령 전송: {command}")
+                except Exception as e:
+                    print(f"UART 전송 에러: {e}")
+        except Exception as e:
+            print(f"키 처리 에러: {e}")
+
+    def start(self):
+        print("\n키보드 컨트롤 시작")
+        print("방향키 사용: 위/아래/왼쪽/오른쪽")
+        print("종료: ESC")
+        
+        # 키보드 리스너를 별도 스레드에서 실행
+        self.keyboard_thread = threading.Thread(target=self._keyboard_listener)
+        self.keyboard_thread.daemon = True
+        self.keyboard_thread.start()
+
+    def _keyboard_listener(self):
+        with keyboard.Listener(on_press=self.on_press) as listener:
+            listener.join()
+
+    def stop(self):
+        self.running = False
+        if hasattr(self, 'ser') and self.ser.is_open:
+            self.ser.close()
+
+class RKNNDetector:
+    def __init__(self, model_path='yolov7-tiny.rknn'):
+        rknn = RKNN()
+        rknn.load_rknn(model_path)
+        ret = rknn.init_runtime()
+        self.rknn = rknn
+        self.input_size = 640
+        print(f"RKNN model loaded: {ret}")
+        print(f"Runtime initialized: {ret}")
+        
+        # 트래커 관련 변수 추가
+        self.trackers = []
+        self.tracking_ids = []
+        self.tracking_classes = []
+        self.next_id = 0
+        self.skip_frames = 0  # 매 N 프레임마다 detection 수행
+        self.frame_count = 0
+        self.tracker_type = "KCF"
+        
+        print('Loading RKNN model...')
+        ret = self.rknn.load_rknn(model_path)
+        if ret != 0:
+            print('Load RKNN model failed')
+            exit(ret)
+        
+        print('Init runtime environment...')
+        ret = self.rknn.init_runtime()
+        if ret != 0:
+            print('Init runtime environment failed')
+            exit(ret)
+        
+        try:
+            with open("coco.names", "r") as f:
+                self.classes = [line.strip() for line in f.readlines()]
+                print(len(self.classes))
+        except FileNotFoundError:
+            print("Warning: coco.names not found. Using default class names.")
+            self.classes = [f"class_{i}" for i in range(80)]
+
+    def process_output(self, output, img_size):
+        try:
+            predictions = []
+            # YOLOv7-tiny 앵커
+            anchors = np.array([
+                [[12,16], [19,36], [40,28]],  # P3/8
+                [[36,75], [76,55], [72,146]], # P4/16
+                [[142,110], [192,243], [459,401]]  # P5/32
+            ])
+            strides = np.array([8., 16., 32.])
+            
+            # 각 feature map 처리
+            for idx, out in enumerate(output):
+                batch, n_boxes, ny, nx = out.shape
+                
+                # 출력 재구성
+                out = out.reshape(batch, 3, 85, ny, nx)
+                out = out.transpose(0, 1, 3, 4, 2)  # (batch, 3, ny, nx, 85)
+                out = out[0]  # 첫 번째 배치만 사용
+                
+                # 그리드 생성
+                yv, xv = np.meshgrid(np.arange(ny), np.arange(nx), indexing='ij')
+                grid = np.stack((xv, yv), axis=2).reshape(1, ny, nx, 2)
+                
+                # 박스 좌표와 신뢰도 계산
+                box_xy = (1 / (1 + np.exp(-out[..., 0:2])) + grid) * strides[idx]  # sigmoid
+                box_wh = (np.exp(out[..., 2:4]) * anchors[idx].reshape(3, 1, 1, 2)) # 앵커 적용
+                box_conf = 1 / (1 + np.exp(-out[..., 4:5]))  # sigmoid
+                box_cls = 1 / (1 + np.exp(-out[..., 5:]))    # sigmoid
+                
+                # 스케일 조정
+                box_xy /= img_size[1], img_size[0]
+                box_wh /= img_size[1], img_size[0]
+                
+                # 중심점 좌표를 좌상단, 우하단 좌표로 변환
+                box_x1y1 = box_xy - box_wh / 2
+                box_x2y2 = box_xy + box_wh / 2
+                boxes = np.concatenate([box_x1y1, box_x2y2], axis=-1)
+                
+                # 신뢰도 점수와 클래스 점수 결합
+                box_scores = box_conf * box_cls
+                
+                # 각 앵커의 예측값 처리
+                for i in range(3):
+                    mask = box_scores[i, ..., 0] > 0.15  # 신뢰도 임계값
+                    if np.any(mask):
+                        b = boxes[i][mask]
+                        c = np.argmax(box_scores[i][mask], axis=-1)
+                        s = np.max(box_scores[i][mask], axis=-1)
+                        predictions.append(np.concatenate([b, s[:, None], c[:, None]], axis=-1))
+            
+            # 모든 예측 결합
+            if predictions:
+                predictions = np.concatenate(predictions, axis=0)
+                
+                # 신뢰도 점수로 정렬
+                score_sort = np.argsort(-predictions[:, 4])
+                predictions = predictions[score_sort]
+                
+                # 상위 N개만 선택 (예: 상위 10개)
+                max_detections = 10
+                if len(predictions) > max_detections:
+                    predictions = predictions[:max_detections]
+                
+                # NMS 적용
+                nms_thresh = 0.45
+                indices = cv2.dnn.NMSBoxes(
+                    predictions[:, :4].tolist(),
+                    predictions[:, 4].tolist(),
+                    0.25,
+                    nms_thresh
+                )
+                
+                if len(indices) > 0:
+                    if isinstance(indices, tuple):
+                        indices = indices[0]
+                    predictions = predictions[indices]
+                    
+                    # 픽셀 좌표로 변환
+                    predictions[:, [0, 2]] *= img_size[1]
+                    predictions[:, [1, 3]] *= img_size[0]
+                    
+                    return (
+                        predictions[:, :4],  # boxes
+                        predictions[:, 5].astype(np.int32),  # class_ids
+                        predictions[:, 4]  # scores
+                    )
+            
+            return [], [], []
+            
+        except Exception as e:
+            print(f"Error in process_output: {e}")
+            import traceback
+            traceback.print_exc()
+            return [], [], []
+    def create_tracker(self):
+        if self.tracker_type == "KCF":
+            return cv2.TrackerKCF_create()
+        elif self.tracker_type == "CSRT":
+            return cv2.TrackerCSRT_create()
+
+    def update_trackers(self, frame):
+        successful_trackers = []
+        successful_ids = []
+        successful_classes = []
+        
+        for tracker, track_id, class_id in zip(self.trackers, self.tracking_ids, self.tracking_classes):
+            success, box = tracker.update(frame)
+            if success:
+                successful_trackers.append((tracker, box))
+                successful_ids.append(track_id)
+                successful_classes.append(class_id)
+            
+        self.trackers = [t[0] for t in successful_trackers]
+        self.tracking_ids = successful_ids
+        self.tracking_classes = successful_classes
+        
+        return [(box, id, cls) for (_, box), id, cls in zip(successful_trackers, successful_ids, successful_classes)]
+    def letterbox(self, img, new_shape=(640, 640), color=(114, 114, 114)):
+        """Resize and pad image while meeting stride-multiple constraints."""
+        shape = img.shape[:2]  # current shape [height, width]
+        
+        # Scale ratio (new / old)
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        
+        # Compute new unpadded dimensions
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        
+        # Compute padding
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        
+        # Divide padding into 2 sides
+        dw /= 2
+        dh /= 2
+        
+        # Resize
+        if shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+            
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        
+        # Add padding
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        
+        return img, r, (dw, dh)
+    def detect(self, frame):
+        try:
+            if frame is None:
+                print("Input frame is None")
+                return None
+
+            print(f"Input frame shape: {frame.shape}")
+            self.frame_count += 1
+            draw_frame = frame.copy()
+
+            # RKNN 추론
+            print("\nPerforming detection...")
+            img, ratio, pad = self.letterbox(frame, new_shape=(self.input_size, self.input_size))
+            
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = np.expand_dims(img, axis=0)
+
+            # 모델 출력 형태 확인
+            outputs = self.rknn.inference(inputs=[img])
+            for i, output in enumerate(outputs):
+                print(f"Output {i} shape: {output.shape}")
+                print(f"Output {i} value range: {np.min(output)} to {np.max(output)}")
+
+            boxes, class_ids, scores = self.process_output(outputs, frame.shape)
+            print(f"Detection results - Boxes: {len(boxes)}, Classes: {len(class_ids)}")
+
+            # 박스 그리기
+            for box, class_id, score in zip(boxes, class_ids, scores):
+                try:
+                    # 박스 좌표를 프레임 크기로 제한
+                    x1, y1, x2, y2 = map(int, box)
+                    x1 = max(0, min(x1, frame.shape[1]-1))
+                    y1 = max(0, min(y1, frame.shape[0]-1))
+                    x2 = max(0, min(x2, frame.shape[1]-1))
+                    y2 = max(0, min(y2, frame.shape[0]-1))
+
+                    # 박스가 너무 작으면 건너뛰기
+                    if (x2-x1 < 10) or (y2-y1 < 10):
+                        continue
+
+                    cv2.rectangle(draw_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    
+                    # 클래스 이름과 신뢰도
+                    class_name = self.classes[class_id] if class_id < len(self.classes) else f"class_{class_id}"
+                    label = f'{class_name} {score:.2f}'
+                    
+                    # 라벨 위치 조정
+                    label_y = y1 - 5
+                    if label_y < 0:  # 라벨이 화면 위로 넘어가면 박스 아래에 표시
+                        label_y = y2 + 20
+                    
+                    # 라벨 배경
+                    label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+                    label_x = min(x1, frame.shape[1] - label_size[0])  # 라벨이 화면 오른쪽을 넘어가지 않도록
+                    
+                    cv2.rectangle(draw_frame, 
+                                (label_x, label_y - label_size[1] - 5), 
+                                (label_x + label_size[0], label_y + 5), 
+                                (255, 255, 255), 
+                                -1)
+                    
+                    # 텍스트
+                    cv2.putText(draw_frame, 
+                            label, 
+                            (label_x, label_y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 
+                            0.5, 
+                            (0, 0, 0), 
+                            2)
+
+                    # 디버깅 정보 출력
+                    print(f"Detected: {class_name} ({score:.2f}) at [{x1},{y1},{x2},{y2}]")
+                    
+                except Exception as e:
+                    print(f"Error drawing box: {e}")
+
+            return draw_frame
+
+        except Exception as e:
+            print(f"Error in detect: {e}")
+            import traceback
+            traceback.print_exc()
+            return frame 
+
+    def __del__(self):
+        if hasattr(self, 'rknn'):
+            self.rknn.release()
+
+def find_working_camera():
+    """Find the first working video device"""
+    # Try mainpath devices first
+    for i in range(7):
+        device = f'/dev/video{i}'
+        print(f"Testing {device}...")
+        if test_camera_device(device):
+            return device
+    
+    raise Exception("No working camera found")
+
+def main():
+    try:
+        video_device = find_working_camera()
+        print(f"Found working camera: {video_device}")
+
+        detector = RKNNDetector()
+        cap = cv2.VideoCapture(video_device)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
+        cv2.namedWindow('Object Detection', cv2.WINDOW_NORMAL)
+        # 여기에 추가: 원하는 표시 크기로 창 크기 초기화 (예: 640x380)
+        cv2.resizeWindow('Object Detection', 640, 380)
+        controller = KeyboardController()
+        controller.start()
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("프레임 캡처 실패")
+                break
+
+            # processed_frame이 None인지 먼저 확인
+            processed_frame = detector.detect(frame)
+            if processed_frame is None:
+                print("Error: processed_frame is None")
+                continue  # 다음 프레임으로 넘어감
+
+            # FPS 계산
+            start_time = time.time()
+            end_time = time.time()
+            fps = 1 / (end_time - start_time)
+            
+            # 프레임에 FPS 표시
+            cv2.putText(processed_frame, f"FPS: {fps:.2f}", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            # 화면에 표시
+            cv2.imshow('Object Detection', processed_frame)
+
+            # 키 입력 처리
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                cv2.imwrite("test_frame.jpg", processed_frame)
+                print("Frame saved")
+
+        cap.release()
+        cv2.destroyAllWindows()
+        del detector
+
+    except Exception as e:
+        print(f"Error in main: {e}")
+        import traceback
+        traceback.print_exc()
+
+if __name__ == '__main__':
+    main()

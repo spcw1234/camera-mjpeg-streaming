@@ -16,27 +16,7 @@ import paho.mqtt.client as mqtt
 import hashlib
 import subprocess
 import time
-import cv2
-import gi
-import os
-import serial
-import threading
-import sys
-import termios
-import tty
-import time
-import select
-import numpy as np
-import json
-import uuid
-import traceback
-import paho.mqtt.client as mqtt
-import hashlib
-import subprocess
-import time
 from rknnlite.api import RKNNLite as RKNN
-import psutil
-import gc
 import psutil
 import gc
 
@@ -48,143 +28,15 @@ except ImportError:
     print("⚠️  pynput을 사용할 수 없습니다 (headless 환경). 키보드 제어는 비활성화됩니다.")
     PYNPUT_AVAILABLE = False
 
-# HTTP 서버를 위한 import 추가
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import socketserver
-from urllib.parse import urlparse
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer, GLib
 
-# ByteTrack 트래킹을 위한 간단한 구현
-class ByteTracker:
-    def __init__(self, track_thresh=0.5, track_buffer=30, match_thresh=0.8):
-        self.track_thresh = track_thresh
-        self.track_buffer = track_buffer
-        self.match_thresh = match_thresh
-        self.tracked_tracks = []
-        self.lost_tracks = []
-        self.frame_id = 0
-        self.next_id = 1
-        
-    def update(self, detections):
-        """ByteTrack 알고리즘으로 트래킹 업데이트"""
-        self.frame_id += 1
-        
-        # 감지된 객체가 없으면 모든 트랙을 lost로 이동
-        if len(detections) == 0:
-            self.lost_tracks.extend(self.tracked_tracks)
-            self.tracked_tracks = []
-            return []
-        
-        # 현재 프레임의 트랙 예측
-        for track in self.tracked_tracks:
-            track['age'] += 1
-            track['time_since_update'] += 1
-        
-        # 높은 신뢰도와 낮은 신뢰도 감지 분리
-        high_conf_dets = [d for d in detections if d['confidence'] > self.track_thresh]
-        low_conf_dets = [d for d in detections if d['confidence'] <= self.track_thresh]
-        
-        # 첫 번째 단계: 높은 신뢰도 감지와 기존 트랙 매칭
-        matches, unmatched_tracks, unmatched_detections = self._match_detections_to_tracks(
-            high_conf_dets, self.tracked_tracks
-        )
-        
-        # 매칭된 트랙 업데이트
-        for track_idx, det_idx in matches:
-            self.tracked_tracks[track_idx].update(detections[det_idx])
-            self.tracked_tracks[track_idx]['time_since_update'] = 0
-        
-        # 두 번째 단계: 낮은 신뢰도 감지와 unmatched 트랙 매칭
-        if len(low_conf_dets) > 0 and len(unmatched_tracks) > 0:
-            low_matches, _, _ = self._match_detections_to_tracks(
-                low_conf_dets, [self.tracked_tracks[i] for i in unmatched_tracks]
-            )
-            for track_idx, det_idx in low_matches:
-                actual_track_idx = unmatched_tracks[track_idx]
-                self.tracked_tracks[actual_track_idx].update(detections[det_idx])
-                self.tracked_tracks[actual_track_idx]['time_since_update'] = 0
-        
-        # 새로운 트랙 생성 (높은 신뢰도 감지만)
-        for det_idx in unmatched_detections:
-            if detections[det_idx]['confidence'] > self.track_thresh:
-                new_track = {
-                    'id': self.next_id,
-                    'bbox': detections[det_idx]['bbox'],
-                    'confidence': detections[det_idx]['confidence'],
-                    'class_id': detections[det_idx]['class_id'],
-                    'age': 1,
-                    'time_since_update': 0,
-                    'update': lambda det: self._update_track(new_track, det)
-                }
-                self.tracked_tracks.append(new_track)
-                self.next_id += 1
-        
-        # 오래된 트랙 제거
-        self.tracked_tracks = [t for t in self.tracked_tracks 
-                              if t['time_since_update'] < self.track_buffer]
-        
-        return self.tracked_tracks
-    
-    def _match_detections_to_tracks(self, detections, tracks):
-        """IOU 기반 매칭"""
-        if len(tracks) == 0:
-            return [], [], list(range(len(detections)))
-        if len(detections) == 0:
-            return [], list(range(len(tracks))), []
-        
-        # IOU 매트릭스 계산
-        iou_matrix = np.zeros((len(tracks), len(detections)))
-        for i, track in enumerate(tracks):
-            for j, det in enumerate(detections):
-                iou_matrix[i, j] = self._calculate_iou(track['bbox'], det['bbox'])
-        
-        # 헝가리안 알고리즘으로 매칭
-        from scipy.optimize import linear_sum_assignment
-        track_indices, det_indices = linear_sum_assignment(-iou_matrix)
-        
-        matches = []
-        unmatched_tracks = []
-        unmatched_detections = []
-        
-        for i in range(len(tracks)):
-            if i in track_indices:
-                det_idx = det_indices[track_indices == i][0]
-                if iou_matrix[i, det_idx] >= self.match_thresh:
-                    matches.append((i, det_idx))
-                else:
-                    unmatched_tracks.append(i)
-            else:
-                unmatched_tracks.append(i)
-        
-        for j in range(len(detections)):
-            if j not in det_indices:
-                unmatched_detections.append(j)
-        
-        return matches, unmatched_tracks, unmatched_detections
-    
-    def _calculate_iou(self, bbox1, bbox2):
-        """두 바운딩 박스의 IOU 계산"""
-        x1, y1, w1, h1 = bbox1
-        x2, y2, w2, h2 = bbox2
-        
-        # 교집합 영역 계산
-        x_left = max(x1, x2)
-        y_top = max(y1, y2)
-        x_right = min(x1 + w1, x2 + w2)
-        y_bottom = min(y1 + h1, y2 + h2)
-        
-        if x_right < x_left or y_bottom < y_top:
-            return 0.0
-        
-        intersection = (x_right - x_left) * (y_bottom - y_top)
-        union = w1 * h1 + w2 * h2 - intersection
-        
-        return intersection / union if union > 0 else 0.0
-    
-    def _update_track(self, track, detection):
-        """트랙 정보 업데이트"""
-        track['bbox'] = detection['bbox']
-        track['confidence'] = detection['confidence']
-        track['class_id'] = detection['class_id']
+# Import DeepSORT dependencies
+from deep_sort import nn_matching
+from deep_sort.detection import Detection
+from deep_sort.tracker import Tracker
+from deep_sort.tools import generate_detections as gdet
 
 def test_camera_device(device_path):
     """Test if a camera device is working"""
@@ -230,7 +82,7 @@ class MQTTClient:
             print(f"✓ 고정 디바이스 ID: {self.unique_id}")
             
             # 카메라 이동 명령 구독
-            move_topic = f"{self.unique_id}/CV/com"
+            move_topic = f"{self.unique_id}/move"
             result = self.client.subscribe(move_topic)
             print(f"✓ 카메라 이동 명령 구독: {move_topic} (결과: {result})")
             
@@ -272,7 +124,7 @@ class MQTTClient:
             print(f"MQTT 메시지 수신 - Topic: {topic}, Payload: {payload}")
             
             # 카메라 이동 명령 처리
-            if topic.endswith('/CV/com') and self.move_callback:
+            if topic.endswith('/move') and self.move_callback:
                 # JSON 형태의 명령 파싱 시도
                 try:
                     import json
@@ -375,13 +227,13 @@ class MQTTClient:
             self.client.disconnect()
     
     def send_gst_info(self):
-        """HTTP 스트리밍 정보를 간단하게 전송 - URL만"""
-        http_url = "http://spcwtech.mooo.com:7200/mobile"
+        """GStreamer 정보를 간단하게 전송 - URL만"""
+        rtsp_url = "rtsp://spcwtech.mooo.com:7200/test"
         if self.gst_server:
-            http_url = self.gst_server.get_mobile_url()
+            rtsp_url = self.gst_server.get_rtsp_url()
         
         # URL만 전송 (uniqueID는 토픽에 이미 포함되어 있음)
-        message = http_url
+        message = rtsp_url
         
         topic = f"{self.unique_id}/CV/gst"
         
@@ -475,395 +327,242 @@ class MQTTClient:
             # 실패 시 기본값 반환
             return "CAM_DEFAULT"
 
-class MJPEGHTTPServer:
-    def __init__(self, port=7200, host='0.0.0.0'):
-        """MJPEG HTTP 서버 초기화"""
+class GStreamerRTSPServer:
+    def __init__(self, port=7200, mount_point="/test"):
+        """GStreamer RTSP 서버 초기화"""
         self.port = port
-        self.host = host
+        self.mount_point = mount_point
         self.server = None
+        self.factory = None
+        self.mainloop = None
         self.running = False
-        self.frame_queue = []
-        self.max_queue_size = 2
-        self.lock = threading.Lock()
+        self.appsrc = None
+        self.need_data = True
+        self.clients_connected = 0
         
-        print(f"MJPEG HTTP 서버 초기화 - Host: {host}, Port: {port}")
+        # GStreamer 초기화 - 스레드 안전성을 위해 메인 스레드에서 수행
+        if not Gst.is_initialized():
+            Gst.init(None)
+        
+        print(f"GStreamer RTSP 서버 초기화 - Port: {port}, Mount: {mount_point}")
     
-    class MJPEGHandler(BaseHTTPRequestHandler):
-        def __init__(self, mjpeg_server, *args, **kwargs):
-            self.mjpeg_server = mjpeg_server
-            super().__init__(*args, **kwargs)
-        
-        def do_GET(self):
-            if self.path == '/stream':
-                self.send_mjpeg_stream()
-            elif self.path == '/mobile':
-                self.send_mobile_page()
-            elif self.path == '/':
-                self.send_index_page()
-            else:
-                self.send_error(404)
-        
-        def send_index_page(self):
-            """간단한 뷰어 페이지"""
-            html = f'''
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>MJPEG Stream</title>
-                <style>
-                    body {{ margin: 0; padding: 20px; text-align: center; background: #000; }}
-                    img {{ max-width: 100%; height: auto; border: 2px solid #fff; }}
-                    h1 {{ color: white; }}
-                </style>
-            </head>
-            <body>
-                <h1>🚀 Camera Stream</h1>
-                <img src="/stream" alt="Live Stream" />
-                <p style="color: white;">실시간 MJPEG 스트리밍</p>
-            </body>
-            </html>
-            '''
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', '*')
-            self.send_header('Cross-Origin-Embedder-Policy', 'unsafe-none')
-            self.send_header('Cross-Origin-Opener-Policy', 'unsafe-none')
-            self.send_header('Cross-Origin-Resource-Policy', 'cross-origin')
-            self.end_headers()
-            self.wfile.write(html.encode())
-        
-        def send_mobile_page(self):
-            """모바일 전용 뷰어 페이지 (전체화면, 터치 제스처 지원)"""
-            html = '''
-            <!DOCTYPE html>
-            <html lang="ko">
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-                <title>모바일 카메라 스트림</title>
-                <style>
-                    * {
-                        margin: 0;
-                        padding: 0;
-                        box-sizing: border-box;
-                    }
-                    
-                    body {
-                        background: #000;
-                        overflow: hidden;
-                        touch-action: manipulation;
-                        -webkit-user-select: none;
-                        -moz-user-select: none;
-                        -ms-user-select: none;
-                        user-select: none;
-                    }
-                    
-                    .container {
-                        width: 100vw;
-                        height: 100vh;
-                        display: flex;
-                        justify-content: center;
-                        align-items: center;
-                        position: relative;
-                    }
-                    
-                    .video-container {
-                        width: 100%;
-                        height: 100%;
-                        position: relative;
-                        overflow: hidden;
-                    }
-                    
-                    #stream {
-                        width: 100%;
-                        height: 100%;
-                        object-fit: cover;
-                        display: block;
-                    }
-                    
-
-                    .status {
-                        position: absolute;
-                        top: 10px;
-                        left: 10px;
-                        color: white;
-                        background: rgba(0, 0, 0, 0.5);
-                        padding: 5px 10px;
-                        border-radius: 5px;
-                        font-size: 12px;
-                        z-index: 100;
-                    }
-                    
-                    .fullscreen-btn {
-                        position: absolute;
-                        top: 10px;
-                        right: 10px;
-                        width: 40px;
-                        height: 40px;
-                        background: rgba(255, 255, 255, 0.2);
-                        border: 1px solid rgba(255, 255, 255, 0.5);
-                        border-radius: 5px;
-                        color: white;
-                        font-size: 16px;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        cursor: pointer;
-                        backdrop-filter: blur(10px);
-                        -webkit-backdrop-filter: blur(10px);
-                        z-index: 100;
-                    }
-                    
-                    @media (orientation: landscape) {
-                        .fullscreen-btn {
-                            top: 10px;
-                            right: 10px;
-                        }
-                    }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <div class="video-container">
-                        <img id="stream" src="/stream" alt="Live Stream" />
-                        
-                        <div class="status" id="status">
-                            연결 중...
-                        </div>
-                        
-                        <button class="fullscreen-btn" onclick="toggleFullscreen()">
-                            ⛶
-                        </button>
-                        
-
-                    </div>
-                </div>
-                
-                <script>
-                    // 화면 깨우기 방지
-                    let wakeLock = null;
-                    
-                    // 전체화면 관련
-                    function toggleFullscreen() {
-                        if (!document.fullscreenElement) {
-                            document.documentElement.requestFullscreen().catch(e => {
-                                console.log('전체화면 요청 실패:', e);
-                            });
-                        } else {
-                            document.exitFullscreen();
-                        }
-                    }
-                    
-                    // 스트림 상태 확인
-                    const streamImg = document.getElementById('stream');
-                    const status = document.getElementById('status');
-                    
-                    streamImg.onload = function() {
-                        status.textContent = '스트림 연결됨';
-                        status.style.background = 'rgba(0, 128, 0, 0.7)';
-                    };
-                    
-                    streamImg.onerror = function() {
-                        status.textContent = '스트림 연결 실패';
-                        status.style.background = 'rgba(128, 0, 0, 0.7)';
-                        
-                        // 3초 후 재시도
-                        setTimeout(() => {
-                            streamImg.src = '/stream?' + Date.now();
-                        }, 3000);
-                    };
-                    
-                    // MQTT 명령은 서버 측에서 처리됨
-                    
-                    // 화면 깨우기 방지 시도
-                    async function requestWakeLock() {
-                        try {
-                            if ('wakeLock' in navigator) {
-                                wakeLock = await navigator.wakeLock.request('screen');
-                                console.log('화면 깨우기 방지 활성화');
-                            }
-                        } catch (e) {
-                            console.log('화면 깨우기 방지 실패:', e);
-                        }
-                    }
-                    
-                    // 페이지 로드 시 실행
-                    window.addEventListener('load', () => {
-                        requestWakeLock();
-                        
-                        // 터치 이벤트 방지 (기본 동작 차단)
-                        document.addEventListener('touchstart', (e) => {
-                            if (!e.target.classList.contains('fullscreen-btn')) {
-                                e.preventDefault();
-                            }
-                        }, { passive: false });
-                        
-                        document.addEventListener('touchmove', (e) => {
-                            e.preventDefault();
-                        }, { passive: false });
-                        
-                        // 자동 전체화면 (사용자 제스처 후)
-                        document.addEventListener('touchstart', function autoFullscreen() {
-                            document.documentElement.requestFullscreen().catch(() => {});
-                            document.removeEventListener('touchstart', autoFullscreen);
-                        }, { once: true });
-                    });
-                    
-                    // 페이지 가시성 변경 시 wake lock 재요청
-                    document.addEventListener('visibilitychange', () => {
-                        if (!document.hidden) {
-                            requestWakeLock();
-                        }
-                    });
-                </script>
-            </body>
-            </html>
-            '''
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/html; charset=utf-8')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', '*')
-            self.send_header('Cross-Origin-Embedder-Policy', 'unsafe-none')
-            self.send_header('Cross-Origin-Opener-Policy', 'unsafe-none')
-            self.send_header('Cross-Origin-Resource-Policy', 'cross-origin')
-            self.send_header('X-Frame-Options', 'ALLOWALL')
-            self.send_header('Content-Security-Policy', 'default-src * data: blob: filesystem: about: ws: wss: \'unsafe-inline\' \'unsafe-eval\'; script-src * data: blob: \'unsafe-inline\' \'unsafe-eval\'; connect-src * data: blob: \'unsafe-inline\'; img-src * data: blob: \'unsafe-inline\'; frame-src * data: blob:; style-src * data: blob: \'unsafe-inline\'; font-src * data: blob: \'unsafe-inline\';')
-            self.end_headers()
-            self.wfile.write(html.encode('utf-8'))
-        
-        def send_mjpeg_stream(self):
-            """MJPEG 스트림 전송"""
-            boundary = 'frame'
-            self.send_response(200)
-            self.send_header('Content-Type', f'multipart/x-mixed-replace; boundary={boundary}')
-            self.send_header('Cache-Control', 'no-cache')
-            self.send_header('Access-Control-Allow-Origin', '*')
-            self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-            self.send_header('Access-Control-Allow-Headers', '*')
-            self.send_header('Cross-Origin-Embedder-Policy', 'unsafe-none')
-            self.send_header('Cross-Origin-Opener-Policy', 'unsafe-none')
-            self.send_header('Cross-Origin-Resource-Policy', 'cross-origin')
-            self.end_headers()
-            
-            try:
-                while self.mjpeg_server.running:
-                    frame = self.mjpeg_server.get_latest_frame()
-                    if frame is not None:
-                        # JPEG 인코딩
-                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-                        _, jpeg = cv2.imencode('.jpg', frame, encode_param)
-                        
-                        # MJPEG 헤더 전송
-                        self.wfile.write(f'--{boundary}\r\n'.encode())
-                        self.wfile.write('Content-Type: image/jpeg\r\n'.encode())
-                        self.wfile.write(f'Content-Length: {len(jpeg)}\r\n\r\n'.encode())
-                        self.wfile.write(jpeg.tobytes())
-                        self.wfile.write('\r\n'.encode())
-                        self.wfile.flush()
-                    
-                    time.sleep(0.033)  # ~30fps
-            except Exception as e:
-                print(f"MJPEG 스트림 전송 오류: {e}")
-        
-        def log_message(self, format, *args):
-            # 로그 메시지 억제
-            pass
-    
-    def handler_factory(self):
-        """핸들러 팩토리"""
-        mjpeg_server = self
-        class Handler(self.MJPEGHandler):
-            def __init__(self, *args, **kwargs):
-                super().__init__(mjpeg_server, *args, **kwargs)
-        return Handler
+    def create_pipeline(self):
+        """🚀 FPS 적응형 저지연 RTSP 파이프라인 생성"""
+        # 실제 프레임레이트에 맞춘 동적 FPS 설정
+        pipeline_str = (
+            "( appsrc name=source is-live=true block=false format=GST_FORMAT_TIME "
+            "do-timestamp=true min-latency=0 max-latency=0 "
+            "max-bytes=0 max-buffers=2 "
+            "caps=video/x-raw,format=BGRx,width=640,height=640,framerate=10/1 ! "
+            "queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
+            "videoconvert ! video/x-raw,format=I420 ! "
+            "queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
+            "x264enc speed-preset=superfast tune=zerolatency bitrate=800 threads=2 "
+            "key-int-max=10 bframes=0 aud=false cabac=false dct8x8=false ! "
+            "queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream ! "
+            "rtph264pay config-interval=1 mtu=1400 name=pay0 pt=96 )"
+        )
+        return pipeline_str
     
     def start_server(self):
-        """HTTP 서버 시작"""
+        """RTSP 서버 시작"""
         try:
-            self.server = HTTPServer((self.host, self.port), self.handler_factory())
+            self.server = GstRtspServer.RTSPServer()
+            self.server.set_service(str(self.port))
+            
+            self.factory = GstRtspServer.RTSPMediaFactory()
+            self.factory.set_launch(self.create_pipeline())
+            self.factory.set_shared(True)
+            
+            # 미디어 팩토리에 콜백 연결
+            self.factory.connect("media-configure", self.on_media_configure)
+            
+            mount_points = self.server.get_mount_points()
+            mount_points.add_factory(self.mount_point, self.factory)
+            
+            self.server.attach(None)
+            
+            # GLib 메인 루프를 별도 스레드에서 실행
+            self.start_glib_loop()
+            
             self.running = True
             
-            # 서버를 별도 스레드에서 실행
-            def serve_forever():
-                try:
-                    self.server.serve_forever()
-                except Exception as e:
-                    print(f"HTTP 서버 오류: {e}")
-            
-            self.server_thread = threading.Thread(target=serve_forever, daemon=True)
-            self.server_thread.start()
-            
-            print(f"✓ MJPEG HTTP 서버 시작됨 - http://spcwtech.mooo.com:{self.port}")
-            print(f"  스트림 URL: http://spcwtech.mooo.com:{self.port}/stream")
-            print(f"  모바일 URL: http://spcwtech.mooo.com:{self.port}/mobile")
-            print(f"  뷰어 URL: http://spcwtech.mooo.com:{self.port}/")
+            print(f"RTSP 서버 시작됨 - rtsp://localhost:{self.port}{self.mount_point}")
             return True
             
         except Exception as e:
-            print(f"HTTP 서버 시작 실패: {e}")
+            print(f"RTSP 서버 시작 실패: {e}")
             traceback.print_exc()
             return False
     
-    def push_frame(self, frame):
-        """프레임을 큐에 추가"""
-        try:
-            if not self.running or frame is None:
-                return False
-            
-            with self.lock:
-                # 큐 크기 제한
-                if len(self.frame_queue) >= self.max_queue_size:
-                    self.frame_queue.pop(0)  # 오래된 프레임 제거
+    def start_glib_loop(self):
+        """GLib 메인 루프를 별도 스레드에서 시작"""
+        def glib_loop():
+            try:
+                # GLib 컨텍스트 설정
+                context = GLib.MainContext.new()
+                GLib.MainContext.push_thread_default(context)
                 
-                self.frame_queue.append(frame.copy())
+                self.mainloop = GLib.MainLoop.new(context, False)
+                self.mainloop.run()
+            except Exception as e:
+                print(f"GLib 메인 루프 오류: {e}")
+            finally:
+                # 컨텍스트 정리
+                try:
+                    GLib.MainContext.pop_thread_default()
+                except:
+                    pass
+        
+        import threading
+        self.glib_thread = threading.Thread(target=glib_loop, daemon=True)
+        self.glib_thread.start()
+        print("GLib 메인 루프 시작됨")
+    
+    def on_media_configure(self, factory, media):
+        """미디어가 구성될 때 호출되는 콜백"""
+        print("[GStreamerRTSPServer] on_media_configure 호출됨")
+        try:
+            element = media.get_element()
+            if element:
+                self.appsrc = element.get_by_name("source")
+                if self.appsrc:
+                    print("appsrc 연결 성공")
+                    
+                    # 🚀 최적화된 appsrc 속성 설정
+                    self.appsrc.set_property("is-live", True)
+                    self.appsrc.set_property("block", False)  # 논블로킹 모드
+                    self.appsrc.set_property("format", Gst.Format.TIME)
+                    self.appsrc.set_property("emit-signals", False)  # 시그널 비활성화로 성능 향상
+                    self.appsrc.set_property("do-timestamp", True)  # 자동 타임스탬프
+                    self.appsrc.set_property("max-bytes", 0)  # 바이트 제한 없음
+                    self.appsrc.set_property("max-buffers", 2)  # 최대 2개 버퍼
+                    
+                    # 🎯 적응형 캡스 설정 - 실제 FPS에 맞춤
+                    caps = Gst.Caps.from_string("video/x-raw,format=BGRx,width=640,height=640,framerate=10/1")
+                    self.appsrc.set_property("caps", caps)
+                    
+                    self.clients_connected += 1
+                    print(f"클라이언트 연결됨 (총 {self.clients_connected}개)")
+                else:
+                    print("appsrc 찾기 실패")
+            else:
+                print("미디어 엘리먼트 찾기 실패")
+        except Exception as e:
+            print(f"미디어 구성 오류: {e}")
+            traceback.print_exc()
+    
+    def on_need_data(self, src, length):
+        """데이터가 필요할 때 호출"""
+        print(f"[GStreamerRTSPServer] on_need_data 호출됨, 요청 길이: {length}, 현재 need_data: {self.need_data}")
+        self.need_data = True
+        print(f"[GStreamerRTSPServer] on_need_data 이후 need_data: {self.need_data}")
+        
+    def on_enough_data(self, src):
+        """충분한 데이터가 있을 때 호출"""
+        print(f"[GStreamerRTSPServer] on_enough_data 호출됨, 현재 need_data: {self.need_data}")
+        self.need_data = False
+        print(f"[GStreamerRTSPServer] on_enough_data 이후 need_data: {self.need_data}")
+    
+    def push_frame(self, frame):
+        """🎯 적응형 FPS 기반 프레임 푸시"""
+        try:
+            if not self.running or self.appsrc is None:
+                return False
+
+            if frame is None:
+                print("[GStreamerRTSPServer] push_frame: 빈 프레임 수신. 스킵.")
+                return False
+
+            # BGR → BGRx 변환
+            frame_bgrx = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+            data = frame_bgrx.tobytes()
+            buf = Gst.Buffer.new_allocate(None, len(data), None)
+            buf.fill(0, data)
+            
+            # 🚀 향상된 타임스탬프 관리
+            current_time = time.time()
+            
+            if not hasattr(self, 'stream_start_time'):
+                self.stream_start_time = current_time
+                self.frame_counter = 0
+                self.target_fps = 10.0  # 목표 FPS
+                self.frame_duration = 1.0 / self.target_fps * Gst.SECOND  # 나노초
+                
+            # 프레임 번호 기반 PTS 계산 (일정한 간격 보장)
+            self.frame_counter += 1
+            buf.pts = int(self.frame_counter * self.frame_duration)
+            buf.duration = int(self.frame_duration)
+            
+            # 실제 시간과 스트림 시간 차이 모니터링
+            stream_time = buf.pts / Gst.SECOND
+            real_time = current_time - self.stream_start_time
+            time_diff = abs(stream_time - real_time)
+            
+            # 5초 이상 차이나면 리셋
+            if time_diff > 5.0:
+                print(f"[GStreamerRTSPServer] 타임스탬프 리셋 (차이: {time_diff:.2f}초)")
+                self.stream_start_time = current_time
+                self.frame_counter = 1
+                buf.pts = int(self.frame_duration)
+            
+            retval = self.appsrc.emit('push-buffer', buf)
+            
+            if retval != Gst.FlowReturn.OK:
+                if retval == Gst.FlowReturn.FLUSHING:
+                    # 정상적인 종료 상황
+                    return False
+                else:
+                    print(f"[GStreamerRTSPServer] push-buffer 실패: {retval}")
+                    return False
+            
+            # 20프레임마다 타이밍 정보 출력
+            if self.frame_counter % 20 == 0:
+                print(f"[스트림] 프레임 {self.frame_counter}, PTS: {stream_time:.2f}s, 실시간: {real_time:.2f}s")
             
             return True
                 
         except Exception as e:
-            print(f"프레임 푸시 오류: {e}")
+            print(f"[GStreamerRTSPServer] push_frame 오류: {e}")
             return False
     
-    def get_latest_frame(self):
-        """최신 프레임 가져오기"""
-        try:
-            with self.lock:
-                if self.frame_queue:
-                    return self.frame_queue[-1]  # 최신 프레임
-                return None
-        except Exception as e:
-            print(f"프레임 가져오기 오류: {e}")
-            return None
-    
     def stop_server(self):
-        """HTTP 서버 중지"""
+        """RTSP 서버 중지"""
         if self.running:
             self.running = False
-            print("MJPEG HTTP 서버 중지 시작...")
+            print("RTSP 서버 중지 시작...")
             
-            if self.server:
+            # appsrc 정리
+            if self.appsrc:
                 try:
-                    self.server.shutdown()
-                    self.server.server_close()
-                    print("✓ HTTP 서버 종료 완료")
+                    self.appsrc.emit("end-of-stream")
+                    print("appsrc end-of-stream 전송 완료")
                 except Exception as e:
-                    print(f"HTTP 서버 종료 오류: {e}")
+                    print(f"appsrc 정리 오류: {e}")
             
-            # 큐 정리
-            with self.lock:
-                self.frame_queue.clear()
+            # GLib 메인 루프 정리
+            if self.mainloop:
+                try:
+                    # 메인 루프를 안전하게 종료하기 위한 idle 함수 추가
+                    def quit_mainloop():
+                        self.mainloop.quit()
+                        return False  # 한 번만 실행
                     
-            print("✓ MJPEG HTTP 서버 중지 완료")
+                    GLib.idle_add(quit_mainloop)
+                    
+                    # 스레드가 종료될 때까지 잠시 대기
+                    if hasattr(self, 'glib_thread') and self.glib_thread.is_alive():
+                        self.glib_thread.join(timeout=2.0)
+                        
+                    print("GLib 메인 루프 종료 완료")
+                except Exception as e:
+                    print(f"GLib 메인 루프 종료 오류: {e}")
+                    
+            print("RTSP 서버 중지 완료")
     
     def get_rtsp_url(self):
-        """호환성을 위한 URL 반환 (실제로는 HTTP URL)"""
-        return f"http://spcwtech.mooo.com:{self.port}/stream"
-    
-    def get_mobile_url(self):
-        """모바일 페이지 URL 반환"""
-        return f"http://spcwtech.mooo.com:{self.port}/mobile"
+        """RTSP URL 반환"""
+        return f"rtsp://spcwtech.mooo.com:{self.port}{self.mount_point}"
 
 class KeyboardController:
     def __init__(self, serial_port=None, baudrate=115200):
@@ -1007,168 +706,176 @@ class KeyboardController:
         # 시리얼 포트는 다른 컴포넌트와 공유할 수 있으므로 닫지 않음
         # 주 프로그램에서 정리됨
 
-class ByteTracker:
-    def __init__(self, track_thresh=0.5, track_buffer=30, match_thresh=0.8):
-        self.track_thresh = track_thresh
-        self.track_buffer = track_buffer
-        self.match_thresh = match_thresh
-        self.tracked_tracks = []
-        self.lost_tracks = []
-        self.frame_id = 0
-        self.next_id = 1
+class DeepSORTTracker:
+    def __init__(self, model_path='/home/spcwtech/mars-small128.pb', 
+                 max_cosine_distance=0.4, nn_budget=None):
+        """Initialize DeepSORT tracker with feature extractor and matching parameters"""
+        print("DeepSORT 트래커 초기화 중...")
+        
+        # DeepSORT 특징 추출기 초기화
+        self.encoder = gdet.create_box_encoder(model_path, batch_size=1)
+        print("DeepSORT 특징 추출기 로드 완료")
+        
+        # Create a tracker
+        metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
+        self.tracker = Tracker(metric, max_age=60)
+        print("DeepSORT 트래커 생성 완료")
+        
+        # Track history for visualization
+        self.track_history = {}  # 트랙 ID -> 위치 목록 딕셔너리
+        self.max_history_len = 30  # 최대 히스토리 길이
+        
+        # Color map for visualization
         self.color_map = {}  # 트랙 ID -> 색상 딕셔너리
-        
-    def update(self, detections):
-        """ByteTrack 알고리즘으로 트래킹 업데이트"""
-        self.frame_id += 1
-        
-        # 감지된 객체가 없으면 모든 트랙을 lost로 이동
+        self.track_class_map = {}
+
+    def update(self, frame, detections):
+        """Update tracker with new detections"""
         if len(detections) == 0:
-            self.lost_tracks.extend(self.tracked_tracks)
-            self.tracked_tracks = []
+            self.tracker.predict()
+            print("DeepSORT: 감지된 객체 없음, 트래커 예측만 수행")
             return []
         
-        # 현재 프레임의 트랙 예측
-        for track in self.tracked_tracks:
-            track['age'] += 1
-            track['time_since_update'] += 1
+        # Extract bounding boxes, scores and class IDs
+        boxes = []
+        scores = []
+        class_ids = []
+        class_ids_dict = {}
+        for det in detections:
+            x, y, w, h, score, class_id = det
+            # Convert x,y,w,h to x1,y1,x2,y2 format
+            x1 = int(max(0, x - w/2))
+            y1 = int(max(0, y - h/2))
+            x2 = int(min(frame.shape[1]-1, x + w/2))
+            y2 = int(min(frame.shape[0]-1, y + h/2))
+            
+            boxes.append([x1, y1, x2 - x1, y2 - y1])  # [x, y, width, height]
+            scores.append(score)
+            class_ids.append(int(class_id))
         
-        # 높은 신뢰도와 낮은 신뢰도 감지 분리
-        high_conf_dets = [d for d in detections if d['confidence'] > self.track_thresh]
-        low_conf_dets = [d for d in detections if d['confidence'] <= self.track_thresh]
+        # Convert to numpy arrays
+        boxes = np.array(boxes)
+        scores = np.array(scores)
+        class_ids = np.array(class_ids)
         
-        # 첫 번째 단계: 높은 신뢰도 감지와 기존 트랙 매칭
-        matches, unmatched_tracks, unmatched_detections = self._match_detections_to_tracks(
-            high_conf_dets, self.tracked_tracks
-        )
+        # Extract features
+        print(f"DeepSORT: {len(boxes)} 객체에 대한 특징 추출 중...")
+        features = self.encoder(frame, boxes)
+        print("DeepSORT: 특징 추출 완료")
         
-        # 매칭된 트랙 업데이트
-        for track_idx, det_idx in matches:
-            self.tracked_tracks[track_idx].update(detections[det_idx])
-            self.tracked_tracks[track_idx]['time_since_update'] = 0
+        # Create detections for DeepSORT
+        detections_for_tracker = []
+        for i in range(len(boxes)):
+            det = Detection(boxes[i], scores[i], features[i], class_ids[i])
+            detections_for_tracker.append(det)
         
-        # 두 번째 단계: 낮은 신뢰도 감지와 unmatched 트랙 매칭
-        if len(low_conf_dets) > 0 and len(unmatched_tracks) > 0:
-            low_matches, _, _ = self._match_detections_to_tracks(
-                low_conf_dets, [self.tracked_tracks[i] for i in unmatched_tracks]
-            )
-            for track_idx, det_idx in low_matches:
-                actual_track_idx = unmatched_tracks[track_idx]
-                self.tracked_tracks[actual_track_idx].update(detections[det_idx])
-                self.tracked_tracks[actual_track_idx]['time_since_update'] = 0
+        # Update tracker
+        self.tracker.predict()
+        self.tracker.update(detections_for_tracker)
+        print(f"DeepSORT: 트래커 업데이트 완료, 현재 트랙 수: {len(self.tracker.tracks)}")
         
-        # 새로운 트랙 생성 (높은 신뢰도 감지만)
-        for det_idx in unmatched_detections:
-            if detections[det_idx]['confidence'] > self.track_thresh:
-                new_track = {
-                    'id': self.next_id,
-                    'bbox': detections[det_idx]['bbox'],
-                    'confidence': detections[det_idx]['confidence'],
-                    'class_id': detections[det_idx]['class_id'],
-                    'age': 1,
-                    'time_since_update': 0,
-                    'update': lambda det: self._update_track(new_track, det)
-                }
-                self.tracked_tracks.append(new_track)
-                self.next_id += 1
+        # Prepare tracking results for visualization
+        results = []
+        for track in self.tracker.tracks:
+            if not track.is_confirmed() or track.time_since_update > 1:
+                continue
+            
+            bbox = track.to_tlbr()  # Get current position in format [x1,y1,x2,y2]
+            track_id = track.track_id
+            center_x = (bbox[0] + bbox[2]) / 2
+            center_y = (bbox[1] + bbox[3]) / 2
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            closest_class_id = None
+            min_dist = float('inf')
+            
+            for (det_x, det_y, det_w, det_h), det_class_id in class_ids_dict.items():
+                # 중심점 거리 계산
+                det_center_x = det_x
+                det_center_y = det_y
+                dist = ((center_x - det_center_x) ** 2 + (center_y - det_center_y) ** 2) ** 0.5
+                
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_class_id = det_class_id
+            
+            # 일정 거리 내에 디텍션이 있으면 클래스 ID 업데이트
+            if min_dist < (w + h) / 2:  # 박스 크기 기반 임계값
+                self.track_class_map[track_id] = closest_class_id
+            
+            # 저장된 클래스 ID 사용
+            class_id = self.track_class_map.get(track_id, 0)  # 기본값 0
+            
+            # 결과 저장
+            results.append((bbox, track_id, class_id))
         
-        # 오래된 트랙 제거
-        self.tracked_tracks = [t for t in self.tracked_tracks 
-                              if t['time_since_update'] < self.track_buffer]
+        # 비활성 트랙의 클래스 ID 매핑 정리
+        active_track_ids = {track.track_id for track in self.tracker.tracks if track.is_confirmed()}
+        for track_id in list(self.track_class_map.keys()):
+            if track_id not in active_track_ids:
+                del self.track_class_map[track_id]
         
-        return self.tracked_tracks
-    
-    def _match_detections_to_tracks(self, detections, tracks):
-        """IOU 기반 매칭"""
-        if len(tracks) == 0:
-            return [], [], list(range(len(detections)))
-        if len(detections) == 0:
-            return [], list(range(len(tracks))), []
-        
-        # IOU 매트릭스 계산
-        iou_matrix = np.zeros((len(tracks), len(detections)))
-        for i, track in enumerate(tracks):
-            for j, det in enumerate(detections):
-                iou_matrix[i, j] = self._calculate_iou(track['bbox'], det['bbox'])
-        
-        # 헝가리안 알고리즘으로 매칭
-        from scipy.optimize import linear_sum_assignment
-        track_indices, det_indices = linear_sum_assignment(-iou_matrix)
-        
-        matches = []
-        unmatched_tracks = []
-        unmatched_detections = []
-        
-        for i in range(len(tracks)):
-            if i in track_indices:
-                det_idx = det_indices[track_indices == i][0]
-                if iou_matrix[i, det_idx] >= self.match_thresh:
-                    matches.append((i, det_idx))
-                else:
-                    unmatched_tracks.append(i)
-            else:
-                unmatched_tracks.append(i)
-        
-        for j in range(len(detections)):
-            if j not in det_indices:
-                unmatched_detections.append(j)
-        
-        return matches, unmatched_tracks, unmatched_detections
-    
-    def _calculate_iou(self, bbox1, bbox2):
-        """두 바운딩 박스의 IOU 계산"""
-        x1, y1, w1, h1 = bbox1
-        x2, y2, w2, h2 = bbox2
-        
-        # 교집합 영역 계산
-        x_left = max(x1, x2)
-        y_top = max(y1, y2)
-        x_right = min(x1 + w1, x2 + w2)
-        y_bottom = min(y1 + h1, y2 + h2)
-        
-        if x_right < x_left or y_bottom < y_top:
-            return 0.0
-        
-        intersection = (x_right - x_left) * (y_bottom - y_top)
-        union = w1 * h1 + w2 * h2 - intersection
-        
-        return intersection / union if union > 0 else 0.0
-    
-    def _update_track(self, track, detection):
-        """트랙 정보 업데이트"""
-        track['bbox'] = detection['bbox']
-        track['confidence'] = detection['confidence']
-        track['class_id'] = detection['class_id']
+        return results
     
     def draw_tracks(self, frame, tracks, class_names=None):
-        """Draw tracking results on frame"""
-        for track in tracks:
-            bbox = track['bbox']
-            track_id = track['id']
-            class_id = track['class_id']
-            confidence = track['confidence']
+        """Draw tracks on the frame"""
+        for bbox, track_id, class_id in tracks:
+            x1, y1, x2, y2 = bbox.astype(int)
             
             # Get color for this track
-            color = self.color_map.get(track_id, (0, 255, 0))
+            if track_id not in self.color_map:
+                # 새로운 트랙에 대해 고유한 색상 생성
+                import random
+                self.color_map[track_id] = (
+                    random.randint(50, 255), 
+                    random.randint(50, 255), 
+                    random.randint(50, 255)
+                )
+            color = self.color_map[track_id]
             
             # Draw bounding box
-            x, y, w, h = bbox
-            cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)), color, 2)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
             
-            # Draw track ID and class
-            label = f"ID:{track_id}"
+            # 클래스 이름 준비
+            class_name = "unknown"
             if class_names and class_id < len(class_names):
-                label += f" {class_names[class_id]}"
-            label += f" {confidence:.2f}"
+                class_name = class_names[class_id]
+            elif class_id is not None:
+                class_name = f"class_{class_id}"
             
-            # Draw label background
-            (label_width, label_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            cv2.rectangle(frame, (int(x), int(y) - label_height - 10), 
-                         (int(x) + label_width, int(y)), color, -1)
+            # Draw track ID and class name
+            label = f"ID:{track_id} {class_name}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            cv2.rectangle(frame, (x1, y1 - label_size[1] - 5), (x1 + label_size[0], y1), color, -1)
+            cv2.putText(frame, label, (x1, y1 - 5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
             
-            # Draw label text
-            cv2.putText(frame, label, (int(x), int(y) - 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            # 중심점 표시
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            cv2.circle(frame, (center_x, center_y), 3, color, -1)
+            
+            # Draw track history
+            if track_id in self.track_history:
+                history = self.track_history[track_id]
+                for i in range(1, len(history)):
+                    if history[i-1] is None or history[i] is None:
+                        continue
+                    # Draw line between consecutive positions
+                    thickness = int(np.sqrt(self.max_history_len / float(i + 1)) * 2)
+                    cv2.line(frame, history[i-1], history[i], color, thickness)
+            
+            # 현재 위치를 히스토리에 추가
+            if track_id not in self.track_history:
+                self.track_history[track_id] = []
+            
+            self.track_history[track_id].append((center_x, center_y))
+            
+            # 히스토리 길이 제한
+            if len(self.track_history[track_id]) > self.max_history_len:
+                self.track_history[track_id].pop(0)
+        
+        return frame
 
 class RKNNDetector:
     def __init__(self, model_path='/home/spcwtech/yolo5n_fish-rk3566.rknn', 
@@ -1204,7 +911,7 @@ class RKNNDetector:
         self.frame_counter = 0
         
         # Initialize GStreamer RTSP server
-        self.gst_server = MJPEGHTTPServer(port=7200, host='0.0.0.0')
+        self.gst_server = GStreamerRTSPServer(port=7200, mount_point="/test")
         self.gst_server.start_server()
         
         # Initialize MQTT client with GStreamer server reference
@@ -1415,22 +1122,36 @@ class RKNNDetector:
                 processed_detections.append([x, y, w, h, score, class_id])
             coord_transform_time = time.time() - coord_transform_start
             
-            # 5. 🚀 ByteTrack 트래킹 적용
+            # 5. 🚀 DeepSORT 트래킹 최적화 (비활성화 가능)
             tracking_start = time.time()
-            if not hasattr(self, 'byte_tracker'):
-                self.byte_tracker = ByteTracker()
-            # ByteTrack 입력 포맷: [{bbox, confidence, class_id} ...]
-            byte_detections = []
-            for det in processed_detections:
-                x, y, w, h, score, class_id = det
-                bbox = [x - w/2, y - h/2, w, h]  # 좌상단 x, y, w, h
-                byte_detections.append({
-                    'bbox': bbox,
-                    'confidence': score,
-                    'class_id': int(class_id)
-                })
-            tracks = self.byte_tracker.update(byte_detections)
-            draw_frame = self.byte_tracker.draw_tracks(draw_frame, tracks, self.classes)
+            if self.enable_deepsort and self.deep_sort:
+                tracks = self.deep_sort.update(frame, processed_detections)
+                draw_frame = self.deep_sort.draw_tracks(draw_frame, tracks, self.classes)
+            else:
+                # DeepSORT 없이 간단한 바운딩 박스만 그리기
+                tracks = []
+                for detection in processed_detections:
+                    x, y, w, h, score, class_id = detection
+                    class_id = int(class_id)
+                    
+                    # 중심점 좌표와 너비, 높이를 좌상단, 우하단 좌표로 변환
+                    x1 = int(max(0, x - w/2))
+                    y1 = int(max(0, y - h/2))
+                    x2 = int(min(frame.shape[1]-1, x + w/2))
+                    y2 = int(min(frame.shape[0]-1, y + h/2))
+
+                    # 박스가 너무 작으면 건너뛰기
+                    if (x2-x1 < 5) or (y2-y1 < 5):
+                        continue
+
+                    # 간단한 박스와 라벨만 그리기
+                    class_name = self.classes[class_id] if class_id < len(self.classes) else f"class_{class_id}"
+                    color = (0, 255, 0)
+                    cv2.rectangle(draw_frame, (x1, y1), (x2, y2), color, 2)
+                    
+                    label = f"{class_name}: {score:.2f}"
+                    cv2.putText(draw_frame, label, (x1, y1-10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             tracking_time = time.time() - tracking_start
             
             # 6. 그리기 시간 측정 (이미 위에서 처리됨)
@@ -1588,9 +1309,10 @@ def main():
     cap = None
     detector = None
     
-    # 프로그램 시작 시 HTTP 서버 초기화
-    print("MJPEG HTTP 서버 초기화 중...")
-    # GStreamer 초기화는 더 이상 필요하지 않음
+    # 프로그램 시작 시 GStreamer 초기화 (메인 스레드에서)
+    print("GStreamer 초기화 중...")
+    if not Gst.is_initialized():
+        Gst.init(None)
     
     # 설정 파일 로드
     config = {
@@ -1599,9 +1321,9 @@ def main():
             "broker_port": 1883,
             "topic_prefix": "camera"
         },
-        "http": {
-            "port": 7500,
-            "host": "0.0.0.0"
+        "gstreamer": {
+            "rtsp_port": 7200,
+            "mount_point": "/test"
         },
         "detection": {
             "model_path": "/home/spcwtech/yolo5n_fish-rk3566.rknn",
@@ -1644,9 +1366,15 @@ def main():
             print(f"카메라 {video_device} 열기 실패")
             raise Exception("카메라를 열 수 없습니다")
         
-        # Headless 모드 - OpenCV 창 생성하지 않음
-        print("Headless 모드로 실행 중... (OpenCV 창 없음)")
-        # GUI 없이 실행 (MJPEG HTTP 스트리밍만 사용)
+        # OpenCV 창 생성 - 메인 스레드에서만 호출
+        print("OpenCV 창 초기화 중...")
+        try:
+            cv2.namedWindow('Object Detection', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Object Detection', 640, 640)
+            print("OpenCV 창 초기화 완료")
+        except Exception as e:
+            print(f"OpenCV 창 초기화 오류: {e}")
+            # 창 초기화 실패 시에도 계속 진행 (headless 모드 지원)
         
         print("메인 루프 시작")
         program_running = True
@@ -1665,10 +1393,23 @@ def main():
             print(f"키보드 컨트롤러 초기화 실패: {e}")
             print("MQTT 제어만 사용됩니다")
         
-        # FPS 계산을 위한 변수들
+        fps_values = []
+        fps_alpha = 0.1
+        current_fps = 0
+
+        # 성능 측정 변수들
+        timing_history = {
+            'frame_capture': [],
+            'rknn_inference': [],
+            'deepsort_update': [],
+            'drawing': [],
+            'gstreamer_push': [],
+            'total_frame': []
+        }
+        max_timing_records = 100
+        
         frame_count = 0
         loop_start_time = time.time()
-        display_fps = 0
 
         while program_running:
             try:
@@ -1692,27 +1433,62 @@ def main():
                 if processed_frame is None:
                     continue
 
-                # 3. 프레임 카운트 증가
+                # 3. 전체 프레임 처리 시간 계산
+                total_frame_time = time.time() - total_frame_start
+                
+                # 4. 성능 통계 기록
+                timing_history['frame_capture'].append(capture_time)
+                timing_history['total_frame'].append(total_frame_time)
+                
+                # 최대 기록 수 제한
+                for key in timing_history:
+                    if len(timing_history[key]) > max_timing_records:
+                        timing_history[key] = timing_history[key][-max_timing_records:]
+                
+                # 5. FPS 계산 (실제 처리 시간 기반)
+                if total_frame_time > 0:
+                    instant_fps = 1 / total_frame_time
+                    if current_fps == 0:
+                        current_fps = instant_fps
+                    else:
+                        current_fps = (fps_alpha * instant_fps) + ((1 - fps_alpha) * current_fps)
+                
+                # 6. 프레임에 성능 정보 표시
+                cv2.putText(processed_frame, f"FPS: {current_fps:.1f}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(processed_frame, f"Frame Time: {total_frame_time*1000:.1f}ms", (10, 60), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(processed_frame, f"Capture: {capture_time*1000:.1f}ms", (10, 85), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                cv2.putText(processed_frame, f"Detect: {detect_time*1000:.1f}ms", (10, 110), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+                
                 frame_count += 1
                 
-                # 4. FPS 계산 (실제 경과 시간 기반)
-                elapsed_time = time.time() - loop_start_time
-                if elapsed_time > 0:
-                    display_fps = frame_count / elapsed_time
-                
-                # 5. 프레임에 정확한 FPS 표시
-                cv2.putText(processed_frame, f"FPS: {display_fps:.1f}", (10, 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                
-                # 30프레임마다 간단한 성능 정보만 출력
-                if frame_count % 30 == 0:
-                    print(f"FPS: {display_fps:.1f}")
+                # 10프레임마다 상세 성능 정보 출력
+                if frame_count % 10 == 0:
+                    avg_capture = sum(timing_history['frame_capture'][-10:]) / min(10, len(timing_history['frame_capture'])) * 1000
+                    avg_total = sum(timing_history['total_frame'][-10:]) / min(10, len(timing_history['total_frame'])) * 1000
+                    elapsed_time = time.time() - loop_start_time
+                    actual_fps = frame_count / elapsed_time
                     
-                    # FPS 계산 리셋
+                    print(f"\n=== 성능 분석 (프레임 {frame_count}) ===")
+                    print(f"실제 평균 FPS: {actual_fps:.2f}")
+                    print(f"평균 프레임 캡처 시간: {avg_capture:.1f}ms")
+                    print(f"평균 전체 처리 시간: {avg_total:.1f}ms")
+                    print(f"이론적 최대 FPS: {1000/avg_total:.1f}")
+                    
+                    if avg_total > 200:  # 200ms 초과시 경고
+                        print(f"⚠️  성능 경고: 프레임 처리 시간이 {avg_total:.1f}ms로 너무 길어 실시간 처리가 어렵습니다.")
+                        print("   - RKNN 모델 최적화 필요")
+                        print("   - DeepSORT 파라미터 조정 필요")
+                        print("   - 해상도 낮추기 고려")
+                    
                     loop_start_time = time.time()
                     frame_count = 0
 
-                # 6. RTSP 스트리밍을 위해 프레임을 GStreamer로 전송
+                # 7. RTSP 스트리밍을 위해 프레임을 GStreamer로 전송
+                gstreamer_start = time.time()
                 if detector.gst_server.running:
                     try:
                         # 640x640으로 리사이즈 (필요시)
@@ -1721,12 +1497,62 @@ def main():
                         else:
                             stream_frame = processed_frame.copy()
                         
-                        # GStreamer 프레임 푸시
+                        # 🎯 개선된 GStreamer 프레임 푸시
                         push_success = detector.gst_server.push_frame(stream_frame)
-                        if not push_success and frame_count % 30 == 0:
-                            print("GStreamer 프레임 푸시 실패")
+                        if not push_success and frame_count % 30 == 0:  # 30프레임마다 실패 로그
+                            print("⚠️  GStreamer 프레임 푸시 실패")
                     except Exception as e:
                         print(f"RTSP 스트림 프레임 전송 실패: {e}")
+                gstreamer_time = time.time() - gstreamer_start
+                
+                # 성능 통계에 GStreamer 시간 추가
+                timing_history['gstreamer_push'].append(gstreamer_time)
+                
+                # 화면 표시 시간 측정
+                display_start = time.time()
+                # 화면에 표시 - GUI 오류 방지를 위한 예외 처리
+                try:
+                    cv2.imshow('Object Detection', processed_frame)
+                except Exception as gui_error:
+                    # GUI 오류 시 무시하고 계속 진행 (headless 모드 지원)
+                    pass
+                display_time = time.time() - display_start
+                
+                # 키 입력 처리 시간 측정
+                input_start = time.time()
+                # 키 입력 처리 (OpenCV 창) - GUI 오류 방지
+                try:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        program_running = False
+                        break
+                    elif key == ord('s'):
+                        cv2.imwrite("captured_frame.jpg", processed_frame)
+                        print("Frame saved to captured_frame.jpg")
+                except Exception as key_error:
+                    # 키 입력 오류 시 무시하고 계속 진행
+                    pass
+                input_time = time.time() - input_start
+                
+                # 추가 성능 정보 표시
+                if frame_count % 10 == 0 and len(timing_history['gstreamer_push']) > 0:
+                    avg_gstreamer = sum(timing_history['gstreamer_push'][-10:]) / min(10, len(timing_history['gstreamer_push'])) * 1000
+                    print(f"GStreamer 푸시 평균: {avg_gstreamer:.1f}ms, 디스플레이: {display_time*1000:.1f}ms")
+                    
+                    if avg_gstreamer > 50:  # 50ms 초과시 경고
+                        print(f"⚠️  GStreamer 푸시 시간이 {avg_gstreamer:.1f}ms로 너무 길어 스트리밍 지연이 발생할 수 있습니다.")
+                
+                # 🎯 스마트 프레임 레이트 제어
+                target_frame_time = 1.0 / 10.0  # 10 FPS 목표
+                if total_frame_time < target_frame_time:
+                    sleep_time = target_frame_time - total_frame_time
+                    # 최소 1ms, 최대 50ms 대기
+                    sleep_time = max(0.001, min(0.05, sleep_time))
+                    time.sleep(sleep_time)
+                elif total_frame_time > target_frame_time * 2:
+                    # 처리 시간이 너무 길면 경고
+                    if frame_count % 30 == 0:
+                        print(f"⚠️  프레임 처리 지연: {total_frame_time*1000:.1f}ms (목표: {target_frame_time*1000:.1f}ms)")
 
             except KeyboardInterrupt:
                 program_running = False
@@ -1759,7 +1585,12 @@ def main():
             except Exception as e:
                 print(f"카메라 리소스 해제 오류: {e}")
         
-        # Headless 모드 - OpenCV 창 정리 생략
+        # OpenCV 창 정리 - 안전하게 처리
+        try:
+            cv2.destroyAllWindows()
+            print("OpenCV 창 정리 완료")
+        except Exception as e:
+            print(f"OpenCV 창 정리 오류: {e}")
         
         if detector:
             try:

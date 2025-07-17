@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""
+🚀 WebSocket 실시간 스트리밍
+- WebSocket으로 실시간 이미지 전송
+- Base64 인코딩으로 웹브라우저에서 실시간 표시
+- 지연시간 최소화
+"""
+
+import cv2
+import asyncio
+import websockets
+import json
+import base64
+import threading
+import time
+import numpy as np
+from rknnlite.api import RKNNLite as RKNN
+import traceback
+
+def find_working_camera():
+    """작동하는 카메라 찾기"""
+    for i in range(12):
+        device = f'/dev/video{i}'
+        try:
+            cap = cv2.VideoCapture(device)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                if ret and frame is not None:
+                    print(f"✓ 카메라 발견: {device}")
+                    return device
+        except:
+            continue
+    raise Exception("작동하는 카메라를 찾을 수 없습니다")
+
+class WebSocketRKNNDetector:
+    """WebSocket용 RKNN 디텍터"""
+    def __init__(self, model_path='/home/spcwtech/yolo5n_fish-rk3566.rknn'):
+        print("🚀 WebSocket RKNN 디텍터 초기화...")
+        
+        self.rknn = RKNN()
+        ret = self.rknn.load_rknn(model_path)
+        if ret != 0:
+            raise Exception('RKNN 모델 로드 실패')
+        
+        ret = self.rknn.init_runtime()
+        if ret != 0:
+            raise Exception('RKNN 런타임 초기화 실패')
+        
+        self.input_size = 640
+        self.frame_skip = 3  # 매 3번째 프레임만 처리
+        self.frame_counter = 0
+        self.last_detections = []
+        
+        print("✓ WebSocket 디텍터 초기화 완료")
+    
+    def letterbox(self, img, new_shape=(640, 640)):
+        """빠른 리사이즈"""
+        return cv2.resize(img, new_shape)
+    
+    def detect(self, frame):
+        """빠른 감지"""
+        try:
+            self.frame_counter += 1
+            if self.frame_counter % self.frame_skip != 0:
+                return self.draw_cached_detections(frame)
+            
+            # 전처리
+            input_frame = self.letterbox(frame, (self.input_size, self.input_size))
+            input_frame = np.expand_dims(input_frame, axis=0)
+            
+            # RKNN 추론
+            outputs = self.rknn.inference(inputs=[input_frame])
+            
+            # 후처리
+            detections = self.decode_predictions(outputs)
+            self.last_detections = detections
+            
+            return self.draw_detections(frame, detections)
+            
+        except Exception as e:
+            return frame
+    
+    def decode_predictions(self, outputs, conf_thres=0.5):
+        """간단한 디코딩"""
+        predictions = []
+        try:
+            for detection in outputs[0]:
+                if len(detection) >= 6:
+                    confidence = float(detection[4])
+                    if confidence > conf_thres:
+                        x, y, w, h = detection[:4]
+                        class_id = int(detection[5])
+                        predictions.append([x, y, w, h, confidence, class_id])
+        except:
+            pass
+        return predictions
+    
+    def draw_cached_detections(self, frame):
+        return self.draw_detections(frame, self.last_detections)
+    
+    def draw_detections(self, frame, detections):
+        for det in detections:
+            try:
+                x, y, w, h, conf, class_id = det
+                x1 = int(x - w/2)
+                y1 = int(y - h/2)
+                x2 = int(x + w/2)
+                y2 = int(y + h/2)
+                
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                cv2.putText(frame, f'{conf:.2f}', (x1, y1-10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            except:
+                continue
+        return frame
+
+class WebSocketStreamer:
+    """WebSocket 스트리머"""
+    def __init__(self):
+        self.clients = set()
+        self.current_frame = None
+        self.running = False
+    
+    async def register_client(self, websocket, path):
+        """클라이언트 등록"""
+        self.clients.add(websocket)
+        print(f"📱 클라이언트 연결됨: {len(self.clients)}명")
+        try:
+            await websocket.wait_closed()
+        finally:
+            self.clients.remove(websocket)
+            print(f"📱 클라이언트 연결 해제: {len(self.clients)}명")
+    
+    async def broadcast_frame(self):
+        """프레임 브로드캐스트"""
+        while self.running:
+            if self.current_frame is not None and self.clients:
+                try:
+                    # JPEG 인코딩
+                    ret, jpeg = cv2.imencode('.jpg', self.current_frame, 
+                                           [cv2.IMWRITE_JPEG_QUALITY, 90])
+                    if ret:
+                        # Base64 인코딩
+                        base64_data = base64.b64encode(jpeg.tobytes()).decode('utf-8')
+                        
+                        # JSON 메시지 생성
+                        message = json.dumps({
+                            'type': 'frame',
+                            'data': base64_data,
+                            'timestamp': time.time()
+                        })
+                        
+                        # 모든 클라이언트에게 전송
+                        disconnected = set()
+                        for client in self.clients.copy():
+                            try:
+                                await client.send(message)
+                            except:
+                                disconnected.add(client)
+                        
+                        # 연결 끊어진 클라이언트 제거
+                        self.clients -= disconnected
+                
+                except Exception as e:
+                    print(f"브로드캐스트 오류: {e}")
+            
+            await asyncio.sleep(0.033)  # ~30 FPS
+    
+    def set_frame(self, frame):
+        """프레임 설정"""
+        self.current_frame = frame
+    
+    def start(self, host='0.0.0.0', port=8765):
+        """WebSocket 서버 시작"""
+        self.running = True
+        
+        # HTML 클라이언트 생성
+        html_content = self.create_html_client()
+        with open('/home/spcwtech/websocket_viewer.html', 'w') as f:
+            f.write(html_content)
+        
+        # WebSocket 서버 시작
+        return websockets.serve(self.register_client, host, port)
+    
+    def create_html_client(self):
+        """HTML 클라이언트 생성"""
+        return """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>🚀 WebSocket 실시간 스트림</title>
+    <style>
+        body { 
+            background: #000; 
+            color: #0f0; 
+            text-align: center; 
+            font-family: Arial; 
+            margin: 0; 
+            padding: 20px;
+        }
+        #stream { 
+            max-width: 90%; 
+            height: auto; 
+            border: 2px solid #0f0; 
+            border-radius: 10px;
+        }
+        h1 { color: #0f0; text-shadow: 0 0 10px #0f0; }
+        #status { 
+            color: #ff0; 
+            font-size: 18px; 
+            margin: 20px 0; 
+        }
+        #fps { 
+            color: #0ff; 
+            font-size: 16px; 
+        }
+    </style>
+</head>
+<body>
+    <h1>🚀 WebSocket 실시간 카메라 스트림</h1>
+    <div id="status">연결 중...</div>
+    <div id="fps">FPS: --</div>
+    <img id="stream" src="" alt="Camera Stream">
+    
+    <script>
+        const ws = new WebSocket('ws://spcwtech.mooo.com:8765');
+        const img = document.getElementById('stream');
+        const status = document.getElementById('status');
+        const fps = document.getElementById('fps');
+        
+        let frameCount = 0;
+        let lastTime = Date.now();
+        
+        ws.onopen = function() {
+            status.textContent = '🟢 연결됨 - 실시간 스트리밍';
+            status.style.color = '#0f0';
+        };
+        
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            if (data.type === 'frame') {
+                img.src = 'data:image/jpeg;base64,' + data.data;
+                
+                // FPS 계산
+                frameCount++;
+                const now = Date.now();
+                if (now - lastTime > 1000) {
+                    const currentFps = (frameCount * 1000 / (now - lastTime)).toFixed(1);
+                    fps.textContent = `FPS: ${currentFps}`;
+                    frameCount = 0;
+                    lastTime = now;
+                }
+            }
+        };
+        
+        ws.onclose = function() {
+            status.textContent = '🔴 연결 끊어짐';
+            status.style.color = '#f00';
+        };
+        
+        ws.onerror = function(error) {
+            status.textContent = '❌ 연결 오류';
+            status.style.color = '#f00';
+        };
+    </script>
+</body>
+</html>
+        """
+    
+    def stop(self):
+        """서버 중지"""
+        self.running = False
+
+async def camera_loop(streamer, detector):
+    """카메라 루프"""
+    try:
+        video_device = find_working_camera()
+        cap = cv2.VideoCapture(video_device)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        if not cap.isOpened():
+            raise Exception("카메라를 열 수 없습니다")
+        
+        print("✓ 카메라 초기화 완료")
+        
+        frame_count = 0
+        start_time = time.time()
+        
+        while streamer.running:
+            ret, frame = cap.read()
+            if not ret:
+                await asyncio.sleep(0.01)
+                continue
+            
+            # 감지 처리
+            processed_frame = detector.detect(frame)
+            
+            # FPS 계산
+            frame_count += 1
+            if frame_count % 60 == 0:
+                elapsed = time.time() - start_time
+                fps = frame_count / elapsed
+                print(f"🚀 카메라 FPS: {fps:.1f}")
+                start_time = time.time()
+                frame_count = 0
+            
+            # 스트리머에 프레임 설정
+            streamer.set_frame(processed_frame)
+            
+            await asyncio.sleep(0.01)
+    
+    except Exception as e:
+        print(f"카메라 루프 오류: {e}")
+        traceback.print_exc()
+    finally:
+        if cap and cap.isOpened():
+            cap.release()
+
+async def main():
+    """메인 함수"""
+    print("🚀 WebSocket 실시간 스트리밍 시작")
+    
+    try:
+        # 디텍터 초기화
+        detector = WebSocketRKNNDetector()
+        
+        # 스트리머 초기화
+        streamer = WebSocketStreamer()
+        
+        # WebSocket 서버 시작
+        server = await streamer.start(host='0.0.0.0', port=8765)
+        
+        print("✅ WebSocket 서버 시작됨:")
+        print(f"   🌐 뷰어: file:///home/spcwtech/websocket_viewer.html")
+        print(f"   🔌 WebSocket: ws://spcwtech.mooo.com:8765")
+        print("\n🚀 스트리밍 시작... (Ctrl+C로 종료)")
+        
+        # 병렬 실행
+        await asyncio.gather(
+            camera_loop(streamer, detector),
+            streamer.broadcast_frame()
+        )
+    
+    except KeyboardInterrupt:
+        print("\n종료 신호 받음...")
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        traceback.print_exc()
+    finally:
+        if 'streamer' in locals():
+            streamer.stop()
+        if 'detector' in locals():
+            try:
+                detector.rknn.release()
+            except:
+                pass
+        print("✅ WebSocket 스트리밍 종료 완료")
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"메인 함수 오류: {e}")
+        traceback.print_exc()

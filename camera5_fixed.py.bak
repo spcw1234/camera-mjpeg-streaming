@@ -1,0 +1,1089 @@
+import cv2
+import gi
+import os
+import serial
+import threading
+import sys
+import termios
+import tty
+import time
+import select
+import numpy as np
+import json
+import uuid
+import traceback
+import paho.mqtt.client as mqtt
+import hashlib
+import subprocess
+import time
+from pynput import keyboard
+from rknnlite.api import RKNNLite as RKNN
+
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer, GLib
+
+# Import DeepSORT dependencies
+from deep_sort import nn_matching
+from deep_sort.detection import Detection
+from deep_sort.tracker import Tracker
+from deep_sort.tools import generate_detections as gdet
+
+def test_camera_device(device_path):
+    """Test if a camera device is working"""
+    try:
+        cap = cv2.VideoCapture(device_path)
+        if not cap.isOpened():
+            return False
+        ret, frame = cap.read()
+        cap.release()
+        return ret and frame is not None
+    except:
+        return False
+
+class MQTTClient:
+    def __init__(self, broker_host='localhost', broker_port=1883, topic_prefix='camera', gst_server=None):
+        """MQTT 클라이언트 초기화"""
+        self.broker_host = broker_host
+        self.broker_port = broker_port
+        self.topic_prefix = topic_prefix
+        self.unique_id = self._generate_fixed_device_id()  # 고정된 디바이스 ID 생성
+        self.client = mqtt.Client()
+        self.gst_server = gst_server  # GStreamer 서버 참조
+        
+        # MQTT 이벤트 핸들러 설정
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
+        self.client.on_publish = self.on_publish
+        self.client.on_message = self.on_message
+        
+        self.connected = False
+        
+        # 카메라 이동 콜백 함수 (외부에서 설정)
+        self.move_callback = None
+        
+        print(f"MQTT 클라이언트 초기화 - Unique ID: {self.unique_id}")
+    
+    def on_connect(self, client, userdata, flags, rc):
+        """MQTT 브로커 연결 콜백"""
+        print(f"MQTT 연결 콜백 호출됨 - 코드: {rc}")
+        if rc == 0:
+            self.connected = True
+            print(f"✓ MQTT 브로커에 연결됨 ({self.broker_host}:{self.broker_port})")
+            print(f"✓ 고정 디바이스 ID: {self.unique_id}")
+            
+            # 카메라 이동 명령 구독
+            move_topic = f"{self.unique_id}/move"
+            result = self.client.subscribe(move_topic)
+            print(f"✓ 카메라 이동 명령 구독: {move_topic} (결과: {result})")
+            
+            # 연결 시 GStreamer 정보 전송
+            print("초기 메시지 전송 중...")
+            self.send_gst_info()
+            # 상태 전송
+            self.send_status("start")  # 시작 시에는 "start" 상태
+        else:
+            print(f"✗ MQTT 연결 실패 - 코드: {rc}")
+    
+    def on_disconnect(self, client, userdata, rc):
+        """MQTT 브로커 연결 해제 콜백"""
+        self.connected = False
+        print("MQTT 브로커 연결 해제됨")
+    
+    def on_publish(self, client, userdata, mid):
+        """메시지 발행 완료 콜백"""
+        print(f"MQTT 메시지 발행 완료 - MID: {mid}")
+    
+    def on_message(self, client, userdata, msg):
+        """MQTT 메시지 수신 콜백"""
+        try:
+            topic = msg.topic
+            payload = msg.payload.decode('utf-8')
+            
+            print(f"MQTT 메시지 수신 - Topic: {topic}, Payload: {payload}")
+            
+            # 카메라 이동 명령 처리
+            if topic.endswith('/move') and self.move_callback:
+                # JSON 형태의 명령 파싱 시도
+                try:
+                    import json
+                    command_data = json.loads(payload)
+                    if isinstance(command_data, dict) and 'move' in command_data:
+                        move_command = command_data['move']
+                        print(f"JSON 명령 파싱: {move_command}")
+                        self.move_callback(move_command)
+                    else:
+                        # 일반 문자열 명령 처리
+                        self.move_callback(payload)
+                except json.JSONDecodeError:
+                    # JSON이 아닌 경우 일반 문자열로 처리
+                    print(f"일반 문자열 명령: {payload}")
+                    self.move_callback(payload)
+                
+        except Exception as e:
+            print(f"메시지 처리 오류: {e}")
+            traceback.print_exc()
+    
+    def set_move_callback(self, callback):
+        """카메라 이동 콜백 함수 설정"""
+        self.move_callback = callback
+    
+    def connect(self):
+        """MQTT 브로커에 연결"""
+        try:
+            print(f"MQTT 브로커 연결 시도: {self.broker_host}:{self.broker_port}")
+            self.client.connect(self.broker_host, self.broker_port, 60)
+            self.client.loop_start()
+            
+            # 연결이 완료될 때까지 대기 (최대 10초)
+            connect_timeout = 10
+            for i in range(connect_timeout):
+                if self.connected:
+                    print("MQTT 연결 성공!")
+                    # 하트비트 스레드 시작
+                    self.start_heartbeat()
+                    return True
+                time.sleep(1)
+                print(f"MQTT 연결 대기 중... ({i+1}/{connect_timeout})")
+            
+            print("MQTT 연결 타임아웃")
+            return False
+        except Exception as e:
+            print(f"MQTT 연결 실패: {e}")
+            return False
+    
+    def start_heartbeat(self):
+        """하트비트, 상태, GStreamer 정보 전송 스레드 시작"""
+        def heartbeat_thread():
+            sta_counter = 0
+            gst_counter = 0
+            print("하트비트 스레드 시작")
+            
+            while True:
+                try:
+                    if not self.connected:
+                        print("MQTT 연결이 끊어짐 - 하트비트 대기 중...")
+                        time.sleep(5)
+                        continue
+                    
+                    # 하트비트 전송 (5초마다)
+                    self.send_heartbeat()
+                    
+                    # 상태 전송 (5분마다)
+                    if sta_counter >= 60:
+                        self.send_status("on")
+                        sta_counter = 0
+                    else:
+                        sta_counter += 1
+                    
+                    # GStreamer 정보 전송 (10초마다)
+                    if gst_counter >= 2:
+                        self.send_gst_info()
+                        gst_counter = 0
+                    else:
+                        gst_counter += 1
+                    
+                    time.sleep(5)
+                    
+                except Exception as e:
+                    print(f"하트비트 전송 실패: {e}")
+                    time.sleep(5)
+            
+        heartbeat_t = threading.Thread(target=heartbeat_thread, daemon=True)
+        heartbeat_t.start()
+    
+    def disconnect(self):
+        """MQTT 브로커 연결 해제"""
+        if self.connected:
+            self.client.loop_stop()
+            self.client.disconnect()
+    
+    def send_gst_info(self):
+        """GStreamer 정보를 간단하게 전송 - URL만"""
+        rtsp_url = "rtsp://localhost:7200/test"
+        if self.gst_server:
+            rtsp_url = self.gst_server.get_rtsp_url()
+        
+        message = rtsp_url
+        topic = f"{self.unique_id}/CV/gst"
+        
+        if self.connected:
+            result = self.client.publish(topic, message)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"GStreamer 정보 전송 - Topic: {topic}")
+    
+    def send_heartbeat(self):
+        """하트비트 전송"""
+        topic = f"{self.unique_id}/CV/sta"
+        message = "a"
+        
+        if self.connected:
+            result = self.client.publish(topic, message)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"하트비트 전송 - Topic: {topic}")
+    
+    def send_status(self, status):
+        """상태 전송"""
+        topic = f"{self.unique_id}/CV/sta"
+        
+        if self.connected:
+            result = self.client.publish(topic, status)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"상태 전송 - Topic: {topic}, Status: {status}")
+    
+    def send_detection_data(self, detections_info):
+        """감지된 객체 정보 전송"""
+        topic = f"{self.unique_id}/CV/obj"
+        
+        if self.connected and detections_info:
+            message = json.dumps(detections_info)
+            result = self.client.publish(topic, message)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                print(f"객체 감지 정보 전송 - Objects: {len(detections_info)}")
+
+    def _generate_fixed_device_id(self):
+        """MAC 주소와 시스템 정보를 기반으로 고정된 디바이스 ID 생성"""
+        try:
+            # MAC 주소 가져오기
+            import subprocess
+            result = subprocess.run(['cat', '/sys/class/net/eth0/address'], 
+                                  capture_output=True, text=True)
+            if result.returncode == 0:
+                mac_address = result.stdout.strip()
+            else:
+                # eth0가 없으면 다른 인터페이스 시도
+                result = subprocess.run(['ls', '/sys/class/net/'], 
+                                      capture_output=True, text=True)
+                interfaces = result.stdout.strip().split('\n')
+                mac_address = "unknown"
+                for interface in interfaces:
+                    if interface not in ['lo']:
+                        try:
+                            result = subprocess.run(['cat', f'/sys/class/net/{interface}/address'], 
+                                                  capture_output=True, text=True)
+                            if result.returncode == 0:
+                                mac_address = result.stdout.strip()
+                                break
+                        except:
+                            continue
+            
+            # 시스템 정보 추가
+            hostname_result = subprocess.run(['hostname'], capture_output=True, text=True)
+            hostname = hostname_result.stdout.strip() if hostname_result.returncode == 0 else "unknown"
+            
+            # MAC 주소와 호스트명을 조합하여 해시 생성
+            unique_string = f"{mac_address}-{hostname}-camera5"
+            device_id = hashlib.md5(unique_string.encode()).hexdigest()[:8]
+            
+            return f"CAM_{device_id}"
+            
+        except Exception as e:
+            print(f"고정 ID 생성 실패, 기본값 사용: {e}")
+            return "CAM_DEFAULT"
+
+class GStreamerRTSPServer:
+    def __init__(self, port=7200, mount_point="/test"):
+        """GStreamer RTSP 서버 초기화"""
+        self.port = port
+        self.mount_point = mount_point
+        self.server = None
+        self.factory = None
+        self.mainloop = None
+        self.running = False
+        self.appsrc = None
+        self.need_data = True
+        self.clients_connected = 0
+        
+        # GStreamer 초기화
+        if not Gst.is_initialized():
+            Gst.init(None)
+        
+        print(f"GStreamer RTSP 서버 초기화 - Port: {port}, Mount: {mount_point}")
+    
+    def create_pipeline(self):
+        """RTSP 스트리밍을 위한 GStreamer 파이프라인 생성"""
+        pipeline_str = (
+            "( appsrc name=source is-live=true block=true format=GST_FORMAT_TIME "
+            "caps=video/x-raw,format=BGR,width=640,height=640,framerate=15/1 ! "
+            "videoconvert ! video/x-raw,format=I420 ! "
+            "x264enc speed-preset=ultrafast tune=zerolatency bitrate=2000 ! "
+            "rtph264pay config-interval=1 name=pay0 pt=96 )"
+        )
+        return pipeline_str
+    
+    def start_server(self):
+        """RTSP 서버 시작"""
+        try:
+            self.server = GstRtspServer.RTSPServer()
+            self.server.set_service(str(self.port))
+            
+            self.factory = GstRtspServer.RTSPMediaFactory()
+            self.factory.set_launch(self.create_pipeline())
+            self.factory.set_shared(True)
+            
+            # 미디어 팩토리에 콜백 연결
+            self.factory.connect("media-configure", self.on_media_configure)
+            
+            mount_points = self.server.get_mount_points()
+            mount_points.add_factory(self.mount_point, self.factory)
+            
+            self.server.attach(None)
+            
+            # GLib 메인 루프를 별도 스레드에서 실행
+            self.start_glib_loop()
+            
+            self.running = True
+            
+            print(f"RTSP 서버 시작됨 - rtsp://localhost:{self.port}{self.mount_point}")
+            return True
+            
+        except Exception as e:
+            print(f"RTSP 서버 시작 실패: {e}")
+            traceback.print_exc()
+            return False
+    
+    def start_glib_loop(self):
+        """GLib 메인 루프를 별도 스레드에서 시작"""
+        def glib_loop():
+            try:
+                # GLib 컨텍스트 설정
+                context = GLib.MainContext.new()
+                GLib.MainContext.push_thread_default(context)
+                
+                self.mainloop = GLib.MainLoop.new(context, False)
+                self.mainloop.run()
+            except Exception as e:
+                print(f"GLib 메인 루프 오류: {e}")
+            finally:
+                # 컨텍스트 정리
+                try:
+                    GLib.MainContext.pop_thread_default()
+                except:
+                    pass
+        
+        import threading
+        self.glib_thread = threading.Thread(target=glib_loop, daemon=True)
+        self.glib_thread.start()
+        print("GLib 메인 루프 시작됨")
+    
+    def on_media_configure(self, factory, media):
+        """미디어가 구성될 때 호출되는 콜백"""
+        try:
+            print("미디어 구성 콜백 호출됨")
+            element = media.get_element()
+            if element:
+                self.appsrc = element.get_by_name("source")
+                if self.appsrc:
+                    print("appsrc 연결 성공")
+                    
+                    # appsrc 속성 설정
+                    self.appsrc.set_property("is-live", True)
+                    self.appsrc.set_property("block", True)
+                    self.appsrc.set_property("format", Gst.Format.TIME)
+                    self.appsrc.set_property("emit-signals", True)
+                    
+                    # 신호 연결
+                    self.appsrc.connect("need-data", self.on_need_data)
+                    self.appsrc.connect("enough-data", self.on_enough_data)
+                    
+                    # 캡스 설정
+                    caps = Gst.Caps.from_string("video/x-raw,format=BGR,width=640,height=640,framerate=15/1")
+                    self.appsrc.set_property("caps", caps)
+                    
+                    self.clients_connected += 1
+                    print(f"클라이언트 연결됨 (총 {self.clients_connected}개)")
+                else:
+                    print("appsrc 찾기 실패")
+            else:
+                print("미디어 엘리먼트 찾기 실패")
+        except Exception as e:
+            print(f"미디어 구성 오류: {e}")
+            traceback.print_exc()
+    
+    def on_need_data(self, src, length):
+        """데이터가 필요할 때 호출"""
+        self.need_data = True
+        
+    def on_enough_data(self, src):
+        """충분한 데이터가 있을 때 호출"""
+        self.need_data = False
+    
+    def push_frame(self, frame):
+        """OpenCV 프레임을 RTSP 스트림으로 푸시"""
+        try:
+            if not self.running or not self.appsrc or not self.need_data:
+                return False
+                
+            # 프레임 크기 확인 및 조정
+            if frame.shape[:2] != (640, 640):
+                frame = cv2.resize(frame, (640, 640))
+                
+            if frame.shape[2] != 3:  # BGR 채널 확인
+                return False
+                
+            height, width, channels = frame.shape
+            
+            # numpy 배열을 bytes로 변환
+            frame_bytes = frame.tobytes()
+            
+            # GStreamer 버퍼 생성
+            buffer = Gst.Buffer.new_allocate(None, len(frame_bytes), None)
+            
+            # 데이터 쓰기
+            buffer.fill(0, frame_bytes)
+            
+            # 타임스탬프 설정
+            buffer.pts = Gst.CLOCK_TIME_NONE
+            buffer.dts = Gst.CLOCK_TIME_NONE
+            buffer.duration = Gst.CLOCK_TIME_NONE
+            
+            # appsrc로 푸시
+            ret = self.appsrc.emit("push-buffer", buffer)
+            
+            if ret == Gst.FlowReturn.OK:
+                return True
+            else:
+                print(f"버퍼 푸시 실패: {ret}")
+                return False
+                
+        except Exception as e:
+            print(f"프레임 푸시 오류: {e}")
+            return False
+    
+    def stop_server(self):
+        """RTSP 서버 중지"""
+        if self.running:
+            self.running = False
+            print("RTSP 서버 중지 시작...")
+            
+            # appsrc 정리
+            if self.appsrc:
+                try:
+                    self.appsrc.emit("end-of-stream")
+                    print("appsrc end-of-stream 전송 완료")
+                except Exception as e:
+                    print(f"appsrc 정리 오류: {e}")
+            
+            # GLib 메인 루프 정리
+            if self.mainloop:
+                try:
+                    def quit_mainloop():
+                        self.mainloop.quit()
+                        return False
+                    
+                    GLib.idle_add(quit_mainloop)
+                    
+                    if hasattr(self, 'glib_thread') and self.glib_thread.is_alive():
+                        self.glib_thread.join(timeout=2.0)
+                        
+                    print("GLib 메인 루프 종료 완료")
+                except Exception as e:
+                    print(f"GLib 메인 루프 종료 오류: {e}")
+                    
+            print("RTSP 서버 중지 완료")
+    
+    def get_rtsp_url(self):
+        """RTSP URL 반환"""
+        return f"rtsp://localhost:{self.port}{self.mount_point}"
+
+class DeepSORTTracker:
+    def __init__(self, model_path='/home/spcwtech/mars-small128.pb', 
+                 max_cosine_distance=0.4, nn_budget=None):
+        """Initialize DeepSORT tracker"""
+        print("DeepSORT 트래커 초기화 중...")
+        
+        # DeepSORT 특징 추출기 초기화
+        try:
+            self.encoder = gdet.create_box_encoder(model_path, batch_size=1)
+            print("DeepSORT 특징 추출기 로드 완료")
+        except Exception as e:
+            print(f"DeepSORT 특징 추출기 로드 실패: {e}")
+            self.encoder = None
+        
+        # Create a tracker
+        metric = nn_matching.NearestNeighborDistanceMetric("cosine", max_cosine_distance, nn_budget)
+        self.tracker = Tracker(metric, max_age=60)
+        print("DeepSORT 트래커 생성 완료")
+        
+        # Track history for visualization
+        self.track_history = {}
+        self.max_history_len = 30
+        
+        # Color map for visualization
+        self.color_map = {}
+        self.track_class_map = {}
+
+    def update(self, frame, detections):
+        """Update tracker with new detections"""
+        if len(detections) == 0 or self.encoder is None:
+            self.tracker.predict()
+            return []
+        
+        # Extract bounding boxes, scores and class IDs
+        boxes = []
+        scores = []
+        class_ids = []
+        
+        for det in detections:
+            x, y, w, h, score, class_id = det
+            # Convert x,y,w,h to x1,y1,x2,y2 format
+            x1 = int(max(0, x - w/2))
+            y1 = int(max(0, y - h/2))
+            x2 = int(min(frame.shape[1]-1, x + w/2))
+            y2 = int(min(frame.shape[0]-1, y + h/2))
+            
+            boxes.append([x1, y1, x2 - x1, y2 - y1])  # [x, y, width, height]
+            scores.append(score)
+            class_ids.append(int(class_id))
+        
+        # Convert to numpy arrays
+        boxes = np.array(boxes)
+        scores = np.array(scores)
+        class_ids = np.array(class_ids)
+        
+        # Extract features
+        try:
+            features = self.encoder(frame, boxes)
+        except Exception as e:
+            print(f"특징 추출 실패: {e}")
+            return []
+        
+        # Create detections for DeepSORT
+        detections_for_tracker = []
+        for i in range(len(boxes)):
+            det = Detection(boxes[i], scores[i], features[i], class_ids[i])
+            detections_for_tracker.append(det)
+        
+        # Update tracker
+        self.tracker.predict()
+        self.tracker.update(detections_for_tracker)
+        
+        # Prepare tracking results for visualization
+        results = []
+        for track in self.tracker.tracks:
+            if not track.is_confirmed() or track.time_since_update > 1:
+                continue
+            
+            bbox = track.to_tlbr()  # Get current position
+            track_id = track.track_id
+            class_id = self.track_class_map.get(track_id, 0)
+            
+            # 결과 저장
+            results.append((bbox, track_id, class_id))
+        
+        return results
+    
+    def draw_tracks(self, frame, tracks, class_names=None):
+        """Draw tracks on the frame"""
+        for bbox, track_id, class_id in tracks:
+            x1, y1, x2, y2 = bbox.astype(int)
+            
+            # Get color for this track
+            if track_id not in self.color_map:
+                import random
+                self.color_map[track_id] = (
+                    random.randint(50, 255), 
+                    random.randint(50, 255), 
+                    random.randint(50, 255)
+                )
+            color = self.color_map[track_id]
+            
+            # Draw bounding box
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            
+            # 클래스 이름 준비
+            class_name = "unknown"
+            if class_names and class_id < len(class_names):
+                class_name = class_names[class_id]
+            
+            # Draw track ID and class name
+            label = f"ID:{track_id} {class_name}"
+            label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            cv2.rectangle(frame, (x1, y1 - label_size[1] - 5), (x1 + label_size[0], y1), color, -1)
+            cv2.putText(frame, label, (x1, y1 - 5), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            
+            # 중심점 표시
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
+            cv2.circle(frame, (center_x, center_y), 3, color, -1)
+        
+        return frame
+
+class RKNNDetector:
+    def __init__(self, model_path='/home/spcwtech/yolo5n_fish-rk3566.rknn', 
+                 mqtt_broker='localhost', mqtt_port=1883):
+        
+        # RKNN 모델 초기화
+        self.rknn = RKNN()
+        try:
+            ret = self.rknn.load_rknn(model_path)
+            if ret != 0:
+                print('Load RKNN model failed')
+                exit(ret)
+                
+            ret = self.rknn.init_runtime()
+            if ret != 0:
+                print('Init runtime environment failed')
+                exit(ret)
+        except Exception as e:
+            print(f"RKNN 초기화 실패: {e}")
+            traceback.print_exc()
+            
+        self.input_size = 640
+        
+        # Initialize DeepSORT tracker
+        self.deep_sort = DeepSORTTracker()
+        
+        # Initialize GStreamer RTSP server
+        self.gst_server = GStreamerRTSPServer(port=7200, mount_point="/test")
+        self.gst_server.start_server()
+        
+        # Initialize MQTT client with GStreamer server reference
+        self.mqtt_client = MQTTClient(
+            broker_host=mqtt_broker, 
+            broker_port=mqtt_port,
+            gst_server=self.gst_server
+        )
+        
+        # 카메라 이동 콜백 설정
+        self.mqtt_client.set_move_callback(self.handle_move_command)
+        self.mqtt_client.connect()
+        
+        # 시리얼 포트 (카메라 이동용)
+        self.serial_port = None
+        self.init_serial_port()
+        
+        # 클래스 이름 로드
+        try:
+            with open("coco.names", "r") as f:
+                self.classes = [line.strip() for line in f.readlines()]
+        except FileNotFoundError:
+            self.classes = [f"class_{i}" for i in range(80)]
+
+        # Detection data tracking for MQTT
+        self.detection_send_interval = 5.0
+        self.last_mqtt_send = time.time()
+
+    def init_serial_port(self):
+        """시리얼 포트 초기화"""
+        serial_ports = ['/dev/ttyS3', '/dev/ttyS0', '/dev/ttyAMA0', '/dev/ttyUSB0']
+        
+        for port in serial_ports:
+            try:
+                self.serial_port = serial.Serial(port, 115200, timeout=1)
+                if self.serial_port.is_open:
+                    print(f"시리얼 포트 {port} 연결 성공!")
+                    break
+                else:
+                    self.serial_port = None
+            except Exception as e:
+                self.serial_port = None
+                continue
+        
+        if self.serial_port is None:
+            print("사용 가능한 시리얼 포트를 찾을 수 없습니다.")
+
+    def handle_move_command(self, command):
+        """MQTT로 받은 카메라 이동 명령 처리"""
+        try:
+            print(f"카메라 이동 명령 수신: {command}")
+            
+            if self.serial_port and self.serial_port.is_open:
+                move_commands = {
+                    "up": "up",
+                    "down": "down", 
+                    "left": "left",
+                    "right": "right",
+                    "stop": "stop"
+                }
+                
+                if command in move_commands:
+                    serial_command = f"{move_commands[command]}\n"
+                    self.serial_port.write(serial_command.encode())
+                    print(f"시리얼 명령 전송: {serial_command.strip()}")
+                else:
+                    print(f"알 수 없는 이동 명령: {command}")
+            else:
+                print("시리얼 포트가 연결되지 않음")
+                
+        except Exception as e:
+            print(f"이동 명령 처리 오류: {e}")
+
+    def decode_predictions(self, output, conf_thres=0.20, max_score=0.95):
+        try:
+            pred = output[0].squeeze().transpose(1, 0)
+            boxes_raw = pred[:, :4]
+            objectness = pred[:, 4] * 10
+            class_probs = pred[:, 5:] * 2
+            class_conf = np.max(class_probs, axis=1)
+            class_ids = np.argmax(class_probs, axis=1)
+            scores = objectness + class_conf 
+            mask = (scores > conf_thres) & (scores <= max_score)
+            boxes_xywh = boxes_raw[mask]
+            scores_filtered = scores[mask]
+            class_ids_filtered = class_ids[mask]
+            
+            if len(boxes_xywh) == 0:
+                return np.array([])
+            
+            detections = np.column_stack([
+                boxes_xywh,
+                scores_filtered,
+                class_ids_filtered
+            ])
+            
+            return detections
+        except Exception as e:
+            return np.array([])
+
+    def apply_nms(self, detections, iou_thres=0.35):
+        try:
+            if len(detections) == 0:
+                return []
+            
+            boxes = detections[:, :4]
+            scores = detections[:, 4]
+            
+            indices = cv2.dnn.NMSBoxes(
+                boxes.tolist(), 
+                scores.tolist(), 
+                score_threshold=0.60,
+                nms_threshold=iou_thres
+            )
+            
+            if len(indices) == 0:
+                return []
+            
+            if isinstance(indices, tuple):
+                indices = indices[0]
+            else:
+                indices = indices.flatten()
+                
+            return detections[indices]
+        except Exception as e:
+            return []
+
+    def letterbox(self, img, new_shape=(640, 640), color=(114, 114, 114)):
+        """Resize and pad image while meeting stride-multiple constraints."""
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        dw /= 2
+        dh /= 2
+        
+        if shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+            
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        
+        return img, r, (dw, dh)
+
+    def detect(self, frame):
+        try:
+            if frame is None:
+                return None
+
+            draw_frame = frame.copy()
+
+            # RKNN 추론
+            img, ratio, pad = self.letterbox(frame, new_shape=(self.input_size, self.input_size))
+            
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = np.expand_dims(img, axis=0)
+
+            # 모델 추론
+            try:
+                outputs = self.rknn.inference(inputs=[img])
+            except KeyboardInterrupt:
+                return draw_frame
+            except Exception as e:
+                return draw_frame
+
+            # 디코딩 및 NMS 적용
+            detections = self.decode_predictions(outputs, conf_thres=0.1, max_score=0.95)
+            detections = self.apply_nms(detections, iou_thres=0.3)
+            
+            # 패딩 제거 및 원본 크기로 복원
+            processed_detections = []
+            for det in detections:
+                x, y, w, h, score, class_id = det
+                x = (x - pad[0]) / ratio
+                y = (y - pad[1]) / ratio
+                w = w / ratio
+                h = h / ratio
+                
+                processed_detections.append([x, y, w, h, score, class_id])
+            
+            # DeepSORT로 트래킹 업데이트
+            tracks = self.deep_sort.update(frame, processed_detections)
+            
+            # MQTT로 객체 감지 정보 전송 (5초마다)
+            current_time = time.time()
+            if current_time - self.last_mqtt_send >= self.detection_send_interval:
+                self.send_tracked_objects_to_mqtt(tracks)
+                self.last_mqtt_send = current_time
+            
+            # 트래킹 결과 그리기
+            draw_frame = self.deep_sort.draw_tracks(draw_frame, tracks, self.classes)
+            
+            # 원본 탐지 결과도 그리기
+            for detection in processed_detections:
+                x, y, w, h, score, class_id = detection
+                class_id = int(class_id)
+                
+                x1 = int(max(0, x - w/2))
+                y1 = int(max(0, y - h/2))
+                x2 = int(min(frame.shape[1]-1, x + w/2))
+                y2 = int(min(frame.shape[0]-1, y + h/2))
+
+                if (x2-x1 < 5) or (y2-y1 < 5):
+                    continue
+
+                class_name = self.classes[class_id] if class_id < len(self.classes) else f"class_{class_id}"
+                cv2.rectangle(draw_frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
+                
+            return draw_frame
+
+        except KeyboardInterrupt:
+            return frame
+        except Exception as e:
+            traceback.print_exc()
+            return frame 
+
+    def send_tracked_objects_to_mqtt(self, tracks):
+        """트래킹된 객체 정보를 MQTT로 전송"""
+        try:
+            if not tracks:
+                return
+            
+            detection_data = []
+            for bbox, track_id, class_id in tracks:
+                x1, y1, x2, y2 = bbox.astype(int)
+                
+                class_name = self.classes[class_id] if class_id < len(self.classes) else f"class_{class_id}"
+                
+                obj_info = {
+                    "track_id": int(track_id),
+                    "class_id": int(class_id),
+                    "class_name": class_name,
+                    "bbox": {
+                        "x1": int(x1),
+                        "y1": int(y1), 
+                        "x2": int(x2),
+                        "y2": int(y2)
+                    },
+                    "center": {
+                        "x": int((x1 + x2) / 2),
+                        "y": int((y1 + y2) / 2)
+                    }
+                }
+                detection_data.append(obj_info)
+            
+            if detection_data:
+                self.mqtt_client.send_detection_data(detection_data)
+                print(f"MQTT 객체 정보 전송 완료: {len(detection_data)}개 객체")
+            
+        except Exception as e:
+            print(f"MQTT 객체 정보 전송 실패: {e}")
+
+    def __del__(self):
+        try:
+            if hasattr(self, 'mqtt_client'):
+                self.mqtt_client.send_status("off")
+                self.mqtt_client.disconnect()
+        except:
+            pass
+        
+        try:
+            if hasattr(self, 'serial_port') and self.serial_port and self.serial_port.is_open:
+                self.serial_port.close()
+        except:
+            pass
+        
+        try:
+            if hasattr(self, 'gst_server'):
+                self.gst_server.stop_server()
+        except:
+            pass
+        
+        try:
+            if hasattr(self, 'rknn'):
+                self.rknn.release()
+        except:
+            pass
+
+def find_working_camera():
+    """Find the first working video device"""
+    for i in range(12):
+        device = f'/dev/video{i}'
+        print(f"Testing {device}...")
+        if test_camera_device(device):
+            return device
+    
+    raise Exception("No working camera found")
+
+# 안전한 종료를 위한 글로벌 플래그
+program_running = True
+
+def main():
+    global program_running
+    cap = None
+    detector = None
+    
+    # 프로그램 시작 시 GStreamer 초기화
+    print("GStreamer 초기화 중...")
+    if not Gst.is_initialized():
+        Gst.init(None)
+    
+    try:
+        video_device = find_working_camera()
+        print(f"Found working camera: {video_device}")
+
+        # RKNN 디텍터 초기화
+        try:
+            detector = RKNNDetector()
+            detector.mqtt_client.send_status("start")
+        except Exception as e:
+            print(f"RKNN 디텍터 초기화 실패: {e}")
+            raise
+        
+        # 카메라 초기화
+        cap = cv2.VideoCapture(video_device)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 640)
+        
+        if not cap.isOpened():
+            print(f"카메라 {video_device} 열기 실패")
+            raise Exception("카메라를 열 수 없습니다")
+        
+        # OpenCV 창 생성
+        print("OpenCV 창 초기화 중...")
+        try:
+            cv2.namedWindow('Object Detection', cv2.WINDOW_NORMAL)
+            cv2.resizeWindow('Object Detection', 640, 640)
+            print("OpenCV 창 초기화 완료")
+        except Exception as e:
+            print(f"OpenCV 창 초기화 오류: {e}")
+        
+        print("메인 루프 시작")
+        program_running = True
+        
+        fps_values = []
+        fps_alpha = 0.1
+        current_fps = 0
+
+        while program_running:
+            try:
+                # 프레임 캡처
+                ret, frame = cap.read()
+                if not ret:
+                    time.sleep(0.1)
+                    continue
+
+                # 처리 시작 시간 기록
+                start_time = time.time()
+                
+                # 프레임 처리
+                processed_frame = detector.detect(frame)
+                if processed_frame is None:
+                    continue
+
+                # FPS 계산
+                end_time = time.time()
+                frame_time = end_time - start_time
+                
+                if frame_time > 0:
+                    instant_fps = 1 / frame_time
+                    if current_fps == 0:
+                        current_fps = instant_fps
+                    else:
+                        current_fps = (fps_alpha * instant_fps) + ((1 - fps_alpha) * current_fps)
+                
+                # 프레임에 FPS 표시
+                cv2.putText(processed_frame, f"FPS: {current_fps:.1f}", (10, 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+                # RTSP 스트리밍을 위해 프레임을 GStreamer로 전송
+                if detector.gst_server.running:
+                    try:
+                        if processed_frame.shape[:2] != (640, 640):
+                            stream_frame = cv2.resize(processed_frame, (640, 640))
+                        else:
+                            stream_frame = processed_frame.copy()
+                        
+                        detector.gst_server.push_frame(stream_frame)
+                    except Exception as e:
+                        print(f"RTSP 스트림 프레임 전송 실패: {e}")
+
+                # 화면에 표시
+                try:
+                    cv2.imshow('Object Detection', processed_frame)
+                except Exception as gui_error:
+                    pass
+
+                # 키 입력 처리
+                try:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        program_running = False
+                        break
+                    elif key == ord('s'):
+                        cv2.imwrite("captured_frame.jpg", processed_frame)
+                        print("Frame saved to captured_frame.jpg")
+                except Exception as key_error:
+                    pass
+                
+                time.sleep(0.01)
+
+            except KeyboardInterrupt:
+                program_running = False
+                break
+            except Exception as e:
+                traceback.print_exc()
+                time.sleep(0.5)
+                continue
+
+    except KeyboardInterrupt:
+        program_running = False
+    except Exception as e:
+        traceback.print_exc()
+    finally:
+        print("프로그램 종료 중...")
+        program_running = False
+        
+        # 리소스 정리
+        if cap and cap.isOpened():
+            try:
+                cap.release()
+                print("카메라 리소스 해제 완료")
+            except Exception as e:
+                print(f"카메라 리소스 해제 오류: {e}")
+        
+        try:
+            cv2.destroyAllWindows()
+            print("OpenCV 창 정리 완료")
+        except Exception as e:
+            print(f"OpenCV 창 정리 오류: {e}")
+        
+        if detector:
+            try:
+                detector.mqtt_client.send_status("stop")
+                del detector
+                print("디텍터 리소스 정리 완료")
+            except Exception as e:
+                print(f"디텍터 리소스 정리 오류: {e}")
+        
+        print("프로그램이 안전하게 종료되었습니다")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        traceback.print_exc()
+    finally:
+        print("프로그램 종료")

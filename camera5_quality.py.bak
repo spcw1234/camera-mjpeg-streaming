@@ -1,0 +1,464 @@
+#!/usr/bin/env python3
+"""
+🎯 고화질 실시간 카메라 스트리밍 프로그램
+- 화질 유지하면서 성능 최적화
+- 스마트 버퍼링
+- 적응형 프레임 레이트
+- GPU 가속 활용
+"""
+
+import cv2
+import gi
+import threading
+import time
+import numpy as np
+import traceback
+import queue
+from rknnlite.api import RKNNLite as RKNN
+
+gi.require_version('Gst', '1.0')
+gi.require_version('GstRtspServer', '1.0')
+from gi.repository import Gst, GstRtspServer, GLib
+
+def find_working_camera():
+    """작동하는 카메라 찾기"""
+    for i in range(12):
+        device = f'/dev/video{i}'
+        try:
+            cap = cv2.VideoCapture(device)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                cap.release()
+                if ret and frame is not None:
+                    print(f"✓ 카메라 발견: {device}")
+                    return device
+        except:
+            continue
+    raise Exception("작동하는 카메라를 찾을 수 없습니다")
+
+class HighQualityGStreamerRTSPServer:
+    """고화질 GStreamer RTSP 서버"""
+    def __init__(self, port=7201, mount_point="/hq"):
+        self.port = port
+        self.mount_point = mount_point
+        self.server = None
+        self.factory = None
+        self.mainloop = None
+        self.running = False
+        self.appsrc = None
+        self.frame_count = 0
+        self.frame_queue = queue.Queue(maxsize=3)  # 작은 큐로 지연 최소화
+        
+        if not Gst.is_initialized():
+            Gst.init(None)
+        print(f"🎯 고화질 RTSP 서버 초기화 - Port: {port}")
+    
+    def create_pipeline(self):
+        """고화질 최적화 파이프라인"""
+        return (
+            "( appsrc name=source is-live=true block=false format=GST_FORMAT_TIME "
+            "do-timestamp=true max-buffers=2 drop=true "
+            "caps=video/x-raw,format=BGR,width=1280,height=720,framerate=25/1 ! "
+            "videoconvert ! video/x-raw,format=I420 ! "
+            "x264enc speed-preset=fast tune=zerolatency bitrate=2000 threads=2 "
+            "key-int-max=25 bframes=1 ref=1 ! "
+            "rtph264pay config-interval=1 mtu=1400 name=pay0 pt=96 )"
+        )
+    
+    def start_server(self):
+        """서버 시작"""
+        try:
+            self.server = GstRtspServer.RTSPServer()
+            self.server.set_service(str(self.port))
+            
+            self.factory = GstRtspServer.RTSPMediaFactory()
+            self.factory.set_launch(self.create_pipeline())
+            self.factory.set_shared(True)
+            self.factory.connect("media-configure", self.on_media_configure)
+            
+            mount_points = self.server.get_mount_points()
+            mount_points.add_factory(self.mount_point, self.factory)
+            self.server.attach(None)
+            
+            # GLib 루프 시작
+            def glib_loop():
+                self.mainloop = GLib.MainLoop()
+                self.mainloop.run()
+            
+            self.glib_thread = threading.Thread(target=glib_loop, daemon=True)
+            self.glib_thread.start()
+            
+            self.running = True
+            print(f"✓ 고화질 RTSP 서버 시작 - rtsp://spcwtech.mooo.com:{self.port}{self.mount_point}")
+            return True
+            
+        except Exception as e:
+            print(f"서버 시작 실패: {e}")
+            return False
+    
+    def on_media_configure(self, factory, media):
+        """미디어 구성"""
+        try:
+            element = media.get_element()
+            if element:
+                self.appsrc = element.get_by_name("source")
+                if self.appsrc:
+                    # 고화질 설정
+                    self.appsrc.set_property("is-live", True)
+                    self.appsrc.set_property("block", False)
+                    self.appsrc.set_property("max-buffers", 2)
+                    self.appsrc.set_property("drop", True)
+                    
+                    caps = Gst.Caps.from_string("video/x-raw,format=BGR,width=1280,height=720,framerate=25/1")
+                    self.appsrc.set_property("caps", caps)
+                    print("✓ 고화질 appsrc 구성 완료")
+        except Exception as e:
+            print(f"미디어 구성 오류: {e}")
+    
+    def push_frame(self, frame):
+        """고화질 프레임 푸시"""
+        try:
+            if not self.running or self.appsrc is None:
+                return False
+            
+            # 고화질 크기로 조정
+            if frame.shape[:2] != (720, 1280):
+                frame = cv2.resize(frame, (1280, 720), interpolation=cv2.INTER_LINEAR)
+            
+            # 데이터 변환
+            data = frame.tobytes()
+            buf = Gst.Buffer.new_allocate(None, len(data), None)
+            buf.fill(0, data)
+            
+            # 타임스탬프
+            self.frame_count += 1
+            buf.pts = self.frame_count * (Gst.SECOND // 25)  # 25fps
+            buf.duration = Gst.SECOND // 25
+            
+            # 푸시
+            retval = self.appsrc.emit('push-buffer', buf)
+            return retval == Gst.FlowReturn.OK
+                
+        except:
+            return False
+    
+    def stop_server(self):
+        """서버 중지"""
+        if self.running:
+            self.running = False
+            if self.appsrc:
+                try:
+                    self.appsrc.emit("end-of-stream")
+                except:
+                    pass
+            if self.mainloop:
+                try:
+                    self.mainloop.quit()
+                except:
+                    pass
+    
+    def get_rtsp_url(self):
+        return f"rtsp://spcwtech.mooo.com:{self.port}{self.mount_point}"
+
+class SmartRKNNDetector:
+    """스마트 RKNN 디텍터 - 화질 우선"""
+    def __init__(self, model_path='/home/spcwtech/yolo5n_fish-rk3566.rknn'):
+        print("🎯 스마트 RKNN 디텍터 초기화...")
+        
+        # RKNN 모델 로드
+        self.rknn = RKNN()
+        ret = self.rknn.load_rknn(model_path)
+        if ret != 0:
+            raise Exception('RKNN 모델 로드 실패')
+        
+        ret = self.rknn.init_runtime()
+        if ret != 0:
+            raise Exception('RKNN 런타임 초기화 실패')
+        
+        self.input_size = 640
+        
+        # 🎯 스마트 최적화 설정
+        self.adaptive_skip = True
+        self.base_skip_rate = 2  # 기본 2프레임마다 처리
+        self.current_skip_rate = self.base_skip_rate
+        self.frame_counter = 0
+        self.last_detections = []
+        self.detection_confidence = 0.0
+        
+        # 성능 모니터링
+        self.processing_times = []
+        self.max_processing_time = 100  # 100ms 목표
+        
+        print("✓ 스마트 디텍터 초기화 완료")
+    
+    def letterbox(self, img, new_shape=(640, 640)):
+        """고품질 리사이즈"""
+        return cv2.resize(img, new_shape, interpolation=cv2.INTER_LINEAR)
+    
+    def decode_predictions(self, output, conf_thres=0.4):
+        """정확한 디코딩"""
+        predictions = []
+        try:
+            for detection in output[0]:
+                if len(detection) >= 6:
+                    confidence = float(detection[4])
+                    if confidence > conf_thres:
+                        x, y, w, h = detection[:4]
+                        class_id = int(detection[5])
+                        predictions.append([x, y, w, h, confidence, class_id])
+        except:
+            pass
+        return predictions
+    
+    def adapt_skip_rate(self, processing_time):
+        """처리 시간에 따른 적응형 스킵 레이트"""
+        if not self.adaptive_skip:
+            return
+        
+        self.processing_times.append(processing_time * 1000)  # ms로 변환
+        if len(self.processing_times) > 10:
+            self.processing_times = self.processing_times[-10:]
+        
+        avg_time = sum(self.processing_times) / len(self.processing_times)
+        
+        if avg_time > self.max_processing_time * 1.5:
+            # 처리가 너무 느리면 스킵 레이트 증가
+            self.current_skip_rate = min(5, self.current_skip_rate + 1)
+        elif avg_time < self.max_processing_time * 0.7:
+            # 처리가 빠르면 스킵 레이트 감소
+            self.current_skip_rate = max(1, self.current_skip_rate - 1)
+    
+    def detect(self, frame):
+        """스마트 감지"""
+        try:
+            start_time = time.time()
+            
+            # 🎯 적응형 프레임 스킵
+            self.frame_counter += 1
+            if self.frame_counter % self.current_skip_rate != 0:
+                # 이전 결과 재사용하지만 화질은 유지
+                return self.draw_cached_detections(frame)
+            
+            # 전처리
+            input_frame = self.letterbox(frame, (self.input_size, self.input_size))
+            input_frame = np.expand_dims(input_frame, axis=0)
+            
+            # RKNN 추론
+            outputs = self.rknn.inference(inputs=[input_frame])
+            
+            # 후처리
+            predictions = self.decode_predictions(outputs, conf_thres=0.4)
+            
+            # 결과 캐시 및 신뢰도 업데이트
+            self.last_detections = predictions
+            if predictions:
+                self.detection_confidence = max([p[4] for p in predictions])
+            
+            # 처리 시간 기반 적응
+            processing_time = time.time() - start_time
+            self.adapt_skip_rate(processing_time)
+            
+            # 그리기
+            return self.draw_detections(frame, predictions)
+            
+        except Exception as e:
+            print(f"감지 오류: {e}")
+            return frame
+    
+    def draw_cached_detections(self, frame):
+        """캐시된 감지 결과 그리기 - 고화질 유지"""
+        return self.draw_detections(frame, self.last_detections)
+    
+    def draw_detections(self, frame, detections):
+        """고품질 감지 결과 그리기"""
+        for det in detections:
+            try:
+                x, y, w, h, conf, class_id = det
+                
+                # 원본 해상도에 맞게 좌표 조정
+                scale_x = frame.shape[1] / self.input_size
+                scale_y = frame.shape[0] / self.input_size
+                
+                x1 = int((x - w/2) * scale_x)
+                y1 = int((y - h/2) * scale_y)
+                x2 = int((x + w/2) * scale_x)
+                y2 = int((y + h/2) * scale_y)
+                
+                # 고품질 그리기
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                
+                # 배경이 있는 텍스트
+                text = f'{conf:.2f}'
+                (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (x1, y1-text_height-10), (x1+text_width, y1), (0, 255, 0), -1)
+                cv2.putText(frame, text, (x1, y1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                
+            except:
+                continue
+        
+        # 성능 정보 표시
+        cv2.putText(frame, f'Skip Rate: 1/{self.current_skip_rate}', (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        if self.processing_times:
+            avg_time = sum(self.processing_times[-5:]) / len(self.processing_times[-5:])
+            cv2.putText(frame, f'Process: {avg_time:.1f}ms', (10, 60), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        return frame
+
+class FrameBuffer:
+    """스마트 프레임 버퍼"""
+    def __init__(self, maxsize=3):
+        self.queue = queue.Queue(maxsize=maxsize)
+        self.lock = threading.Lock()
+    
+    def put_frame(self, frame):
+        """프레임 추가 (가득 찬 경우 오래된 프레임 제거)"""
+        with self.lock:
+            if self.queue.full():
+                try:
+                    self.queue.get_nowait()  # 오래된 프레임 제거
+                except queue.Empty:
+                    pass
+            
+            try:
+                self.queue.put_nowait(frame)
+                return True
+            except queue.Full:
+                return False
+    
+    def get_frame(self):
+        """최신 프레임 가져오기"""
+        with self.lock:
+            if self.queue.empty():
+                return None
+            
+            # 큐에 있는 모든 프레임을 비우고 가장 최신 것만 반환
+            frame = None
+            while not self.queue.empty():
+                try:
+                    frame = self.queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            return frame
+
+def main():
+    """고화질 메인 함수"""
+    print("🎯 고화질 실시간 카메라 스트리밍 시작")
+    
+    cap = None
+    detector = None
+    gst_server = None
+    frame_buffer = FrameBuffer(maxsize=2)
+    
+    try:
+        # GStreamer 초기화
+        if not Gst.is_initialized():
+            Gst.init(None)
+        
+        # 카메라 찾기
+        video_device = find_working_camera()
+        
+        # 카메라 초기화 (고화질 설정)
+        cap = cv2.VideoCapture(video_device)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        # 추가 화질 설정
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        cap.set(cv2.CAP_PROP_BRIGHTNESS, 0.5)
+        cap.set(cv2.CAP_PROP_CONTRAST, 0.5)
+        cap.set(cv2.CAP_PROP_SATURATION, 0.5)
+        
+        if not cap.isOpened():
+            raise Exception("카메라를 열 수 없습니다")
+        
+        print("✓ 고화질 카메라 초기화 완료")
+        
+        # 스마트 디텍터 초기화
+        detector = SmartRKNNDetector()
+        
+        # 고화질 RTSP 서버 초기화
+        gst_server = HighQualityGStreamerRTSPServer(port=7201, mount_point="/hq")
+        if not gst_server.start_server():
+            raise Exception("RTSP 서버 시작 실패")
+        
+        print(f"\n🎥 고화질 스트리밍 URL: {gst_server.get_rtsp_url()}")
+        print("🎯 고화질 처리 시작... (Ctrl+C로 종료)")
+        
+        # 캡처 스레드
+        def capture_thread():
+            while True:
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    frame_buffer.put_frame(frame)
+                time.sleep(0.01)  # 100 FPS 캡처
+        
+        capture_t = threading.Thread(target=capture_thread, daemon=True)
+        capture_t.start()
+        
+        frame_count = 0
+        start_time = time.time()
+        fps_counter = 0
+        
+        while True:
+            # 최신 프레임 가져오기
+            frame = frame_buffer.get_frame()
+            if frame is None:
+                time.sleep(0.001)
+                continue
+            
+            # 스마트 처리
+            processed_frame = detector.detect(frame)
+            
+            # 고화질 스트리밍
+            gst_server.push_frame(processed_frame)
+            
+            # FPS 카운터
+            fps_counter += 1
+            if fps_counter % 25 == 0:
+                elapsed = time.time() - start_time
+                fps = fps_counter / elapsed
+                print(f"🎯 고화질 FPS: {fps:.1f}, 스킵 레이트: 1/{detector.current_skip_rate}")
+                
+                # 리셋
+                start_time = time.time()
+                fps_counter = 0
+            
+            # 적응형 대기
+            time.sleep(0.02)  # 50 FPS 출력
+    
+    except KeyboardInterrupt:
+        print("\n종료 신호 받음...")
+    except Exception as e:
+        print(f"오류 발생: {e}")
+        traceback.print_exc()
+    finally:
+        print("리소스 정리 중...")
+        
+        if cap and cap.isOpened():
+            cap.release()
+            print("✓ 카메라 해제")
+        
+        if gst_server:
+            gst_server.stop_server()
+            print("✓ RTSP 서버 중지")
+        
+        if detector:
+            try:
+                detector.rknn.release()
+            except:
+                pass
+            print("✓ 디텍터 정리")
+        
+        print("✅ 고화질 프로그램 종료 완료")
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as e:
+        print(f"메인 함수 오류: {e}")
+        traceback.print_exc()
