@@ -14,7 +14,7 @@ This project provides real-time camera streaming using MJPEG over HTTP with MQTT
 - **HTTP Server**: `http://0.0.0.0:7200`
 - **Stream Endpoint**: `/stream`
 - **Web Viewer**: `/`
-- **MQTT Broker**: `spcwtech.mooo.com:1883`
+- **MQTT Broker**: ``
 
 ## Usage
 
